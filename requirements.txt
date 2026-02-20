@@ -1,0 +1,11 @@
+opencv-python==4.13.0.90
+mediapipe==0.10.9
+pandas==2.3.3
+scikit-learn==1.8.0
+pyttsx3==2.99
+SpeechRecognition==3.14.5
+PyAudio==0.2.14
+gTTS==2.5.4
+pygame==2.6.1
+streamlit==1.52.2
+streamlit-autorefresh==1.0.1

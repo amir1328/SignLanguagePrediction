@@ -1,0 +1,10 @@
+
+dataset.csv
+sign_model.pkl
+
+audio_signs/
+sign_gifs/
+
+__pycache__/
+*.pyc
+.env

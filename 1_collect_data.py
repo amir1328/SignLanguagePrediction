@@ -4,6 +4,7 @@ import os
 import time
 import mediapipe as mp
 import gtts
+import imageio
 
 # Configuration
 DATASET_FILE    = "dataset.csv"
@@ -60,7 +61,14 @@ def main():
     print(f"{'='*50}\n")
 
     # 1. Initialize CSV Header if needed
-    header = [f"{axis}{i}" for i in range(21) for axis in ("x", "y", "z")] + ["label"]
+    # Header format: x0_L, y0_L, z0_L ... x20_L, y20_L, z20_L, x0_R, y0_R, z0_R ... x20_R, y20_R, z20_R, label
+    header = []
+    for hand in ('L', 'R'):
+        for i in range(21):
+            for axis in ('x', 'y', 'z'):
+                header.append(f"{axis}{i}_{hand}")
+    header.append("label")
+    
     if not os.path.exists(DATASET_FILE):
         with open(DATASET_FILE, "w", newline="") as f:
             csv.writer(f).writerow(header)
@@ -78,10 +86,14 @@ def main():
             
         # 3. Generate Audio for the Label
         audio_dir = "audio_signs"
+        gif_dir   = "sign_gifs"
         if not os.path.exists(audio_dir):
             os.makedirs(audio_dir)
+        if not os.path.exists(gif_dir):
+            os.makedirs(gif_dir)
             
         audio_path = os.path.join(audio_dir, f"{label.lower()}.mp3")
+        gif_path   = os.path.join(gif_dir, f"{label.lower()}.gif")
         if not os.path.exists(audio_path):
             print(f"[*] Generating speech audio for '{label}'...")
             try:
@@ -107,13 +119,14 @@ def main():
     mp_hands = mp.solutions.hands
     mp_draw  = mp.solutions.drawing_utils
     hands    = mp_hands.Hands(
-        max_num_hands=1,
+        max_num_hands=2,
         min_detection_confidence=0.7,
         min_tracking_confidence=0.7
     )
 
     collected_frames = 0
     is_recording     = False
+    gif_frames       = []
     
     print(f"\n[READY] Camera active.")
     print(f"        Press 'R' to Start Recording")
@@ -136,20 +149,25 @@ def main():
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             result = hands.process(rgb_frame)
 
-            landmark_row = None
+            # We need exactly 126 features (63 per hand * 2 hands)
+            features = []
+            # MediaPipe doesn't strictly guarantee index 0 is left and index 1 is right, 
+            # but we process up to 2 hands found in the frame.
             if result.multi_hand_landmarks:
-                for hand_lms in result.multi_hand_landmarks:
-                    # Draw elegant connections
+                for i in range(min(2, len(result.multi_hand_landmarks))):
+                    hand_lms = result.multi_hand_landmarks[i]
                     mp_draw.draw_landmarks(
                         frame, hand_lms, mp_hands.HAND_CONNECTIONS,
                         mp_draw.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=3),
                         mp_draw.DrawingSpec(color=(0,0,255), thickness=2, circle_radius=2)
                     )
-                    
-                    # Flatten coordinates
-                    landmark_row = []
+                    # Extract 63 features for this hand
                     for lm in hand_lms.landmark:
-                        landmark_row.extend([lm.x, lm.y, lm.z])
+                        features.extend([lm.x, lm.y, lm.z])
+            
+            # Pad to 126 features if only 1 hand or no hands are detected
+            while len(features) < 126:
+                features.append(0.0)
 
             # Keyboard Input
             key = cv2.waitKey(1) & 0xFF
@@ -157,12 +175,21 @@ def main():
                 print("\n[!] Cancelled by user.")
                 break
             elif key == ord('r') or key == ord('R'):
-                is_recording = True
-                print("\n[REC] Recording started...")
+                if not is_recording:
+                    is_recording = True
+                    collected_frames = 0
+                    gif_frames = []
+                    print("\n[REC] Recording started...")
 
             # Save data if recording
-            if is_recording and landmark_row:
-                writer.writerow(landmark_row + [label])
+            if is_recording: # We always have 126 features due to padding
+                writer.writerow(features + [label])
+                
+                # Capture every 5th frame for the GIF, resize to 320x240 to save space
+                if collected_frames % 5 == 0:
+                    small_frame = cv2.resize(rgb_frame, (320, 240))
+                    gif_frames.append(small_frame)
+                    
                 collected_frames += 1
 
             # UI Overlays
@@ -185,6 +212,14 @@ def main():
     if collected_frames >= FRAMES_PER_SIGN:
         print(f"\n[✔] Successfully recorded {FRAMES_PER_SIGN} frames for '{label}'.")
         print(f"    Data saved to {DATASET_FILE}")
+        
+        if gif_frames:
+            print(f"[*] Generating Avatar GIF ({len(gif_frames)} frames)...")
+            try:
+                imageio.mimsave(gif_path, gif_frames, fps=15)
+                print(f"    [✔] Saved GIF to {gif_path}")
+            except Exception as e:
+                print(f"    [!] Error saving GIF: {e}")
 
 if __name__ == "__main__":
     main()

@@ -8,3 +8,6 @@ sign_gifs/
 __pycache__/
 *.pyc
 .env
+*.keras
+*.npy
+dataset/

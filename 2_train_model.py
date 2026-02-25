@@ -1,92 +1,92 @@
-"""
-Phase 3: Model Training
-=======================
-Trains the RandomForest classifier on the dataset and prints a clean report.
-"""
-
-import pandas as pd
-import pickle
 import os
-from sklearn.ensemble import RandomForestClassifier
+import numpy as np
+import tensorflow as tf
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
-# Configuration
-DATASET_FILE = "dataset.csv"
-MODEL_FILE   = "sign_model.pkl"
+# Enable GPU Memory Growth (fixes crashes on standard consumer GPUs)
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("[!] GPU Memory Growth Enabled.")
+    except Exception as e:
+        print(f"[!] Warning limiting GPU growth: {e}")
+else:
+    print("[!] No GPU found, falling back to CPU. Ensure CUDA/cuDNN is installed if you want GPU acceleration.")
+
+DATASET_PATH = "dataset"
+MODEL_FILE = "sign_lstm_model.keras"
+SEQUENCE_LENGTH = 30
+
+def get_data():
+    if not os.path.exists(DATASET_PATH):
+        return None, None, None
+
+    actions = np.array(os.listdir(DATASET_PATH))
+    if len(actions) < 2:
+        return actions, None, None
+
+    label_map = {label:num for num, label in enumerate(actions)}
+    
+    sequences, labels = [], []
+    for action in actions:
+        action_path = os.path.join(DATASET_PATH, action)
+        for sequence in np.array(os.listdir(action_path)):
+            if not sequence.endswith('.npy'):
+                continue
+            res = np.load(os.path.join(action_path, sequence))
+            sequences.append(res)
+            labels.append(label_map[action])
+
+    X = np.array(sequences)
+    y = to_categorical(labels).astype(int)
+    return actions, X, y
 
 def main():
     print(f"\n{'='*50}")
-    print(f" 🧠 SIGN LANGUAGE MODEL TRAINING  ")
+    print(f" 🧠 LSTM NEURAL NETWORK TRAINING  ")
     print(f"{'='*50}\n")
 
-    # 1. Load Data
-    if not os.path.exists(DATASET_FILE):
-        print(f"[!] FATAL: Dataset '{DATASET_FILE}' not found.")
-        print("    Please run '1_collect_data.py' to record some signs first.")
+    actions, X, y = get_data()
+    
+    if X is None or len(actions) < 2:
+        print("[!] FATAL: You need at least 2 different signs recorded in 'dataset/'.")
+        print("    Please run '1_collect_data.py' first to build sequence arrays.")
         return
         
-    print(f"[*] Loading dataset from '{DATASET_FILE}'...")
-    df = pd.read_csv(DATASET_FILE)
-    if df.empty:
-        print("[!] FATAL: Dataset is empty.")
-        return
-
-    # Info summary
-    total_frames = len(df)
-    labels       = sorted(df['label'].unique())
-    print(f"[*] Total frames recorded: {total_frames}")
-    print(f"[*] Unique signs class : {', '.join(labels)} ({len(labels)} total)")
-
-    if len(labels) < 2:
-        print("\n[!] WARNING: You only have one sign recorded.")
-        print("    The model won't be able to distinguish between different signs.")
-        print("    Please collect at least 2 different signs before training.")
-        return
-
-    # 2. Split Data
-    print("\n[*] Splitting dataset (80% Train, 20% Test)...")
-    X = df.drop(columns=["label"]).values
-    y = df["label"].values
-
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-    except ValueError as e:
-        print(f"\n[!] FATAL SPLITTING ERROR: {e}")
-        print("    This usually means you have very few frames for one of your signs.")
-        return
-
-    # 3. Train
-    print("[*] Training RandomForest Classifier (n_trees=200)...")
-    clf = RandomForestClassifier(n_estimators=200, max_depth=None, random_state=42, n_jobs=-1)
+    print(f"[*] Found {len(actions)} signs: {', '.join(actions)}")
+    print(f"[*] Dataset Input Shape: {X.shape}") # Should be (num_sequences, 30, 126)
     
-    # Simple terminal spinner imitation
-    print("    Working", end="", flush=True)
-    clf.fit(X_train, y_train)
-    print(" ... Done!")
-
-    # 4. Evaluate
-    y_pred = clf.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1)
     
-    print(f"\n{'-'*50}")
-    print(f" MODEL PERFORMANCE REPORT ")
-    print(f" Overall Accuracy: {acc*100:.2f}%")
-    print(f"{'-'*50}")
+    print("\n[*] Compiling Spatial-Temporal LSTM Model...")
+    model = Sequential()
+    # Expects input shape (frames_per_sequence, features_per_frame)
+    model.add(LSTM(64, return_sequences=True, activation='relu', input_shape=(SEQUENCE_LENGTH, X.shape[2])))
+    model.add(LSTM(128, return_sequences=True, activation='relu'))
+    model.add(LSTM(64, return_sequences=False, activation='relu'))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(actions.shape[0], activation='softmax'))
     
-    # Hide the warnings and long text, summarize cleanly
-    report = classification_report(y_test, y_pred, zero_division=0)
-    print(report)
-
-    # 5. Save
-    print(f"[*] Saving trained model to '{MODEL_FILE}'...")
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(clf, f)
-
-    print("\n[✔] SUCCESS! Model is ready for live recognition.")
-    print("    You can now run '3_live_app.py'.\n")
+    model.compile(optimizer='Adam', loss='categorical_crossentropy', metrics=['categorical_accuracy'])
+    
+    print("\n[*] Training Model (200 Epochs)...")
+    # Training the neural network. 200 epochs is a good baseline for 2-3 signs
+    model.fit(X_train, y_train, epochs=200, validation_data=(X_test, y_test))
+    
+    print(f"\n[*] Saving trained model to '{MODEL_FILE}'...")
+    model.save(MODEL_FILE)
+    
+    # Save the action labels so the Inference UI app knows what to map the index output to
+    np.save('actions.npy', actions)
+    print("    [+] Actions map saved to 'actions.npy'")
+    
+    print("\n[✔] SUCCESS! Deep Learning LSTM Model is completely ready.")
 
 if __name__ == "__main__":
     main()

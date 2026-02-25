@@ -3,9 +3,10 @@ import os
 import time
 import queue
 import threading
-import pickle
+import numpy as np
 import cv2
 import mediapipe as mp
+import tensorflow as tf
 
 import gtts
 import pygame
@@ -19,30 +20,39 @@ from PyQt5.QtWidgets import (
 )
 
 # Configuration
-MODEL_FILE         = "sign_model.pkl"
-PREDICTION_HISTORY = 7
+MODEL_FILE         = "sign_lstm_model.keras"
 TTS_COOLDOWN       = 1.5
 
+# Enable GPU Memory Growth for TensorFlow to prevent UI freezing / VRAM crashing
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except Exception as e:
+        print(f"[!] Warning limiting GPU growth: {e}")
+
+# No face indices needed anymore
+
+def extract_keypoints(results):
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
+    
+    return np.concatenate([lh, rh])
+
 # =============================================================================
-# 1. Camera Handling (from 1_collect_data.py)
+# 1. Camera Handling
 # =============================================================================
 def get_camera():
-    backends = [
-        ("DirectShow (DSHOW)", cv2.CAP_DSHOW),
-        ("Media Foundation (MSMF)", cv2.CAP_MSMF),
-        ("Default (ANY)", cv2.CAP_ANY)
-    ]
-    indices = [1, 0, 2]
-    
-    for index in indices:
+    backends = [("DirectShow (DSHOW)", cv2.CAP_DSHOW), ("Media Foundation (MSMF)", cv2.CAP_MSMF), ("Default (ANY)", cv2.CAP_ANY)]
+    for index in [1, 0, 2]:
         for name, backend in backends:
             cap = cv2.VideoCapture(index, backend)
             if cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None:
                     return cap
-                else:
-                    cap.release()
+                cap.release()
     return None
 
 # =============================================================================
@@ -50,88 +60,83 @@ def get_camera():
 # =============================================================================
 
 class CameraThread(QThread):
-    """Processes OpenCV and MediaPipe data on a background thread to keep UI fast."""
+    """Processes OpenCV and MediaPipe Holistic data on a background thread."""
     change_pixmap_signal = pyqtSignal(QImage)
     sign_detected_signal = pyqtSignal(str)
     
-    def __init__(self, model):
+    def __init__(self, model_file):
         super().__init__()
         self._run_flag = True
-        self.model = model
+        self.model_file = model_file
         
     def run(self):
         cap = get_camera()
         if not cap:
             return
             
-        mp_hands = mp.solutions.hands
-        mp_draw  = mp.solutions.drawing_utils
-        hands    = mp_hands.Hands(
-            max_num_hands=2,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
-        )
+        # Load Model INSIDE thread to avoid TensorFlow graph crossing
+        if os.path.exists(self.model_file):
+            model = tf.keras.models.load_model(self.model_file)
+        else:
+            model = None
+            
+        actions = np.load('actions.npy') if os.path.exists('actions.npy') else []
         
-        history = []
+        mp_holistic = mp.solutions.holistic
+        mp_draw  = mp.solutions.drawing_utils
+        
+        sequence = []
         last_spoken = ""
         last_spoken_time = 0.0
 
-        while self._run_flag and cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
+        with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+            while self._run_flag and cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+                    
+                frame = cv2.flip(frame, 1)
+                h, w, ch = frame.shape
                 
-            frame = cv2.flip(frame, 1)
-            h, w, ch = frame.shape
-            
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = hands.process(rgb_frame)
-            
-            current_sign = ""
-            
-            # Machine Learning Prediction
-            if result.multi_hand_landmarks:
-                features = []
-                for i in range(min(2, len(result.multi_hand_landmarks))):
-                    hand_lms = result.multi_hand_landmarks[i]
-                    mp_draw.draw_landmarks(
-                        rgb_frame, hand_lms, mp_hands.HAND_CONNECTIONS,
-                        mp_draw.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=3),
-                        mp_draw.DrawingSpec(color=(0,0,255), thickness=2, circle_radius=2)
-                    )
-                    for lm in hand_lms.landmark:
-                        features.extend([lm.x, lm.y, lm.z])
-                        
-                while len(features) < 126:
-                    features.append(0.0)
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = holistic.process(rgb_frame)
+                
+                # Visuals
+                if results.left_hand_landmarks:
+                    mp_draw.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                if results.right_hand_landmarks:
+                    mp_draw.draw_landmarks(frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                
+                # Machine Learning Prediction Vector
+                keypoints = extract_keypoints(results)
+                sequence.append(keypoints)
+                sequence = sequence[-30:] # Rolling window of 30 frames
+                
+                current_sign = ""
+                
+                # Only predict if we have a full rolling window of 30 frames AND the model exists
+                if len(sequence) == 30 and model is not None and len(actions) > 0:
+                    # Keras expects (batches, timesteps, features)
+                    res = model.predict(np.expand_dims(sequence, axis=0), verbose=0)[0]
+                    # CONFIDENCE THRESHOLD: 75%
+                    if res[np.argmax(res)] > 0.75:
+                        current_sign = actions[np.argmax(res)]
                     
-                if self.model:
-                    pred = self.model.predict([features])[0]
-                    history.append(pred)
-                    if len(history) > PREDICTION_HISTORY:
-                        history.pop(0)
-                    current_sign = max(set(history), key=history.count)
-            else:
-                history.append("")
-                if len(history) > PREDICTION_HISTORY:
-                    history.pop(0)
-                if history:
-                    current_sign = max(set(history), key=history.count)
-                    
-            # Logic for when to trigger a new chat bubble / TTS
-            now = time.time()
-            if current_sign and current_sign != "" and current_sign != last_spoken and (now - last_spoken_time) > TTS_COOLDOWN:
-                self.sign_detected_signal.emit(current_sign)
-                last_spoken = current_sign
-                last_spoken_time = now
-            elif current_sign == "":
-                last_spoken = ""
-            
-            # Convert frame to Qt Format and emit
-            bytes_per_line = ch * w
-            qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            self.change_pixmap_signal.emit(qt_image)
+                # Debounce/Cooldown Logic
+                now = time.time()
+                if current_sign and current_sign != "" and current_sign != last_spoken and (now - last_spoken_time) > TTS_COOLDOWN:
+                    self.sign_detected_signal.emit(current_sign)
+                    last_spoken = current_sign
+                    last_spoken_time = now
+                elif current_sign == "":
+                    last_spoken = "" # Reset if no sign is confidently detected
+                
+                # Convert frame to Qt Format and emit
+                # Note: We emit the `frame` (BGR) but QImage expects RGB, so we swap it again, or just use the RGB we processed
+                bytes_per_line = ch * w
+                qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                self.change_pixmap_signal.emit(qt_image)
             
         cap.release()
         
@@ -159,14 +164,12 @@ class AudioWorker(QThread):
         # 2. Main TTS Loop
         while self._run_flag:
             try:
-                # Wait for something in the queue with a timeout so we can exit cleanly
                 text = self.tts_q.get(timeout=0.5)
                 if text == "QUIT_COMMAND":
                     break
                     
                 audio_file = os.path.join("audio_signs", f"{text.lower()}.mp3")
                 if not os.path.exists(audio_file):
-                    # fallback dynamic generation if file missing
                     tts = gtts.gTTS(text=text, lang='en')
                     audio_file = f"temp_{int(time.time())}.mp3"
                     tts.save(audio_file)
@@ -185,33 +188,40 @@ class AudioWorker(QThread):
             except queue.Empty:
                 pass
             except Exception as e:
-                print(f"[Audio Error] {e}")
+                pass
 
     def stt_loop(self):
         recognizer = sr.Recognizer()
-        # Tighten the limits so it translates sentences much faster
         recognizer.pause_threshold = 0.5
         recognizer.dynamic_energy_threshold = True
         
-        mic = sr.Microphone()
-        
+        try:
+            mic = sr.Microphone()
+        except Exception as e:
+            print(f"\n[STT ERROR] Failed to access microphone: {e}")
+            return
         with mic as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            print("\n[STT] Microphone configured. Calibrating noise...")
+            recognizer.adjust_for_ambient_noise(source, duration=1.0)
+            recognizer.energy_threshold = 300 # Lower threshold to catch softer words
+            recognizer.dynamic_energy_threshold = False # Stop it from auto-muting you
             
+            print("[STT] Listening in background...")
             while self._run_flag:
                 try:
-                    # Timeout = time it waits for someone to START speaking
-                    # phrase_time_limit = maximum length of a sentence before it cuts and translates
-                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=7)
+                    # Give it strict boundaries so it processes words instantly
+                    audio = recognizer.listen(source, timeout=2, phrase_time_limit=3)
+                    print("[STT] Processing audio...")
                     text = recognizer.recognize_google(audio)
                     if text:
+                        print(f"[STT] Heard: {text}")
                         self.heard_signal.emit(text)
                 except sr.WaitTimeoutError:
                     pass
                 except sr.UnknownValueError:
                     pass
                 except Exception as e:
-                    pass
+                    print(f"[STT ERROR] Recognition failed: {e}")
                     
     def stop(self):
         self._run_flag = False
@@ -225,7 +235,7 @@ class AudioWorker(QThread):
 class SignLanguageApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Two-Way Sign Language Communicator")
+        self.setWindowTitle("Two-Way Sign Language Communicator (LSTM GPU)")
         self.resize(1200, 750)
         self.setStyleSheet("background-color: #1a1a1a; color: white; font-family: Segoe UI, sans-serif;")
         
@@ -269,7 +279,7 @@ class SignLanguageApp(QMainWindow):
         left_layout.addWidget(self.avatar_container, alignment=Qt.AlignCenter)
         
         # Status text below camera/avatar
-        self.status_label = QLabel("Initializing Systems...")
+        self.status_label = QLabel("Initializing Deep Learning Engine...")
         self.status_label.setFont(QFont("Segoe UI", 12))
         self.status_label.setStyleSheet("color: #aaaaaa;")
         left_layout.addWidget(self.status_label)
@@ -281,7 +291,7 @@ class SignLanguageApp(QMainWindow):
         right_panel.setStyleSheet("background-color: #2b2b2b; border-radius: 15px;")
         right_layout = QVBoxLayout(right_panel)
         
-        header = QLabel("Chat History")
+        header = QLabel("Communication History")
         header.setFont(QFont("Segoe UI", 16, QFont.Bold))
         header.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(header)
@@ -301,33 +311,27 @@ class SignLanguageApp(QMainWindow):
         
         # --- Initialization ---
         self.init_ai()
-        self.add_bubble("System Ready. Start signing or speaking to begin.", sender="system")
+        self.add_bubble("GPU LSTM Sequence Network Ready. Start signing or speaking.", sender="system")
 
     def init_ai(self):
-        # Load Model
-        model = None
-        if os.path.exists(MODEL_FILE):
-            with open(MODEL_FILE, "rb") as f:
-                model = pickle.load(f)
-                
-        # Start Threads
+        # Start Audio/STT Thread
         self.audio_thread = AudioWorker()
         self.audio_thread.heard_signal.connect(self.on_speech_heard)
         self.audio_thread.start()
         
-        self.camera_thread = CameraThread(model)
+        # Start Camera/Holistic Thread running Keras
+        self.camera_thread = CameraThread(MODEL_FILE)
         self.camera_thread.change_pixmap_signal.connect(self.update_image)
         self.camera_thread.sign_detected_signal.connect(self.on_sign_detected)
         self.camera_thread.start()
-        self.status_label.setText("🟢 Live: Camera and Microphone Active")
+        
+        self.status_label.setText("🟢 LSTM Network & Microphone Active")
 
     def update_image(self, qt_image):
-        """Updates the video label with the latest OpenCV frame."""
         scaled_img = qt_image.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.video_label.setPixmap(QPixmap.fromImage(scaled_img))
 
     def add_bubble(self, text, sender):
-        """Adds a WhatsApp style chat bubble to the scroll view."""
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 5, 0, 5)
@@ -338,55 +342,41 @@ class SignLanguageApp(QMainWindow):
         msg_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         
         if sender == "signer":
-            # Right-aligned, green
             msg_label.setStyleSheet("background-color: #00882b; color: white; padding: 12px; border-radius: 12px;")
             row_layout.addStretch()
             row_layout.addWidget(msg_label)
         elif sender == "hearing":
-            # Left-aligned, dark gray
             msg_label.setStyleSheet("background-color: #4a4a4a; color: white; padding: 12px; border-radius: 12px;")
             row_layout.addWidget(msg_label)
             row_layout.addStretch()
         else:
-            # System text
             msg_label.setStyleSheet("color: #888888; font-style: italic;")
             msg_label.setAlignment(Qt.AlignCenter)
             row_layout.addWidget(msg_label)
             
         self.chat_layout.addWidget(row)
-        
-        # Auto-scroll to bottom
         QTimer.singleShot(100, lambda: self.scroll_area.verticalScrollBar().setValue(
             self.scroll_area.verticalScrollBar().maximum()
         ))
 
     def on_sign_detected(self, sign_text):
-        """Triggered when the signer completes a valid sign structure."""
         self.add_bubble(sign_text.capitalize(), sender="signer")
-        self.audio_thread.speak(sign_text) # trigger TTS 
+        self.audio_thread.speak(sign_text)
 
     def on_speech_heard(self, text):
-        """Triggered when the hearing person speaks into the microphone."""
         self.add_bubble(text, sender="hearing")
-        
-        # Check if any detected words have matching GIFs
         words = text.lower().split()
         for word in words:
-            # Strip punctuation like "hi!" to "hi"
             clean_word = ''.join(e for e in word if e.isalnum())
             gif_path = os.path.join("sign_gifs", f"{clean_word}.gif")
             if os.path.exists(gif_path):
                 self.play_avatar_gif(gif_path)
 
     def play_avatar_gif(self, path):
-        """Adds a new GIF to the queue, shifting older ones to the right."""
-        # Shift the paths array instead of QMovies
         self.avatar_paths = [path, self.avatar_paths[0], self.avatar_paths[1]]
-        
         for i in range(3):
             if self.movies[i]:
                 self.movies[i].stop()
-                
             p = self.avatar_paths[i]
             if p and os.path.exists(p):
                 self.movies[i] = QMovie(p)
@@ -397,9 +387,6 @@ class SignLanguageApp(QMainWindow):
                 self.movies[i] = None
                 self.avatar_labels[i].clear()
                 self.avatar_labels[i].hide()
-                
-        # Force PyQt to immediately redraw the screen so 
-        # multiple rapid STT detections visually update all labels
         QApplication.processEvents()
         
     def hide_all_avatar_gifs(self):

@@ -9,3 +9,4 @@ gTTS==2.5.4
 pygame==2.6.1
 PyQt5==5.15.11
 imageio==2.37.2
+tensorflow==2.15.0

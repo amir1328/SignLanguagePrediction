@@ -86,6 +86,7 @@ class CameraThread(QThread):
         mp_draw  = mp.solutions.drawing_utils
         
         sequence = []
+        predictions = [] # Keep a rolling log of recent predictions
         last_spoken = ""
         last_spoken_time = 0.0
 
@@ -119,9 +120,21 @@ class CameraThread(QThread):
                 if len(sequence) == 30 and model is not None and len(actions) > 0:
                     # Keras expects (batches, timesteps, features)
                     res = model.predict(np.expand_dims(sequence, axis=0), verbose=0)[0]
-                    # CONFIDENCE THRESHOLD: 90%
-                    if res[np.argmax(res)] > 0.90:
-                        current_sign = actions[np.argmax(res)]
+                    # Log the index of what the AI thought
+                    predictions.append(np.argmax(res))
+                    
+                    # We only analyze the last 10 predictions 
+                    # This prevents rapid "flickering" between two similar signs mid-motion
+                    if len(predictions) >= 10:
+                        predictions = predictions[-10:]
+                        
+                        # If the AI has guessed the *exact same* sign for the last 10 frames consecutively
+                        majority_vote = np.unique(predictions[-10:])[0] 
+                        if np.all(np.array(predictions[-10:]) == majority_vote):
+                            
+                            # CONFIDENCE THRESHOLD: 90%
+                            if res[majority_vote] > 0.90:
+                                current_sign = actions[majority_vote]
                     
                 # Debounce/Cooldown Logic
                 now = time.time()
@@ -130,7 +143,8 @@ class CameraThread(QThread):
                     last_spoken = current_sign
                     last_spoken_time = now
                 elif current_sign == "":
-                    last_spoken = "" # Reset if no sign is confidently detected
+                    # Reset if no sign is confidently and consecutively detected
+                    pass
                 
                 # Convert frame to Qt Format and emit
                 # Note: We emit the `frame` (BGR) but QImage expects RGB, so we swap it again, or just use the RGB we processed

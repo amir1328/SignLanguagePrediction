@@ -119,8 +119,8 @@ class CameraThread(QThread):
                 if len(sequence) == 30 and model is not None and len(actions) > 0:
                     # Keras expects (batches, timesteps, features)
                     res = model.predict(np.expand_dims(sequence, axis=0), verbose=0)[0]
-                    # CONFIDENCE THRESHOLD: 75%
-                    if res[np.argmax(res)] > 0.75:
+                    # CONFIDENCE THRESHOLD: 90%
+                    if res[np.argmax(res)] > 0.90:
                         current_sign = actions[np.argmax(res)]
                     
                 # Debounce/Cooldown Logic

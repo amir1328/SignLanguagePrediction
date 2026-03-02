@@ -4,7 +4,7 @@ import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 
 # Enable GPU Memory Growth (fixes crashes on standard consumer GPUs)
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -61,25 +61,33 @@ def main():
     print(f"[*] Found {len(actions)} signs: {', '.join(actions)}")
     print(f"[*] Dataset Input Shape: {X.shape}") # Should be (num_sequences, 30, 126)
     
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1)
-    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # --- Data Augmentation: subtle noise to avoid overfitting without masking sign differences ---
+    print("[*] Augmenting training data with noise...")
+    noise = np.random.normal(0, 0.005, X_train.shape)  # 0.5% noise — subtle enough to preserve sign differences
+    X_train = np.concatenate([X_train, X_train + noise])
+    y_train = np.concatenate([y_train, y_train])
+    print(f"    [+] Augmented training set size: {X_train.shape[0]} sequences")
+
     print("\n[*] Compiling Spatial-Temporal LSTM Model...")
     model = Sequential()
-    # Expects input shape (frames_per_sequence, features_per_frame)
     model.add(LSTM(64, return_sequences=True, activation='relu', input_shape=(SEQUENCE_LENGTH, X.shape[2])))
+    model.add(Dropout(0.2))
     model.add(LSTM(128, return_sequences=True, activation='relu'))
+    model.add(Dropout(0.2))
     model.add(LSTM(64, return_sequences=False, activation='relu'))
     model.add(Dense(64, activation='relu'))
+    model.add(Dropout(0.2))
     model.add(Dense(32, activation='relu'))
     model.add(Dense(actions.shape[0], activation='softmax'))
-    
+
     model.compile(optimizer='Adam', loss='categorical_crossentropy', metrics=['categorical_accuracy'])
-    
-    print("\n[*] Training Model (200 Epochs)...")
-    # Training the neural network. 200 epochs is a good baseline for 2-3 signs
+
+    print("\n[*] Training Model (200 Epochs — full run for best discrimination)...")
     model.fit(X_train, y_train, epochs=200, validation_data=(X_test, y_test))
-    
-    print(f"\n[*] Saving trained model to '{MODEL_FILE}'...")
+
+    print(f"\n[*] Saving best model to '{MODEL_FILE}'...")
     model.save(MODEL_FILE)
     
     # Save the action labels so the Inference UI app knows what to map the index output to

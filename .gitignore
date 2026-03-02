@@ -11,3 +11,4 @@ __pycache__/
 *.keras
 *.npy
 dataset/
+*.mp4

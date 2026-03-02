@@ -35,9 +35,19 @@ if gpus:
 # No face indices needed anymore
 
 def extract_keypoints(results):
-    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
-    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
-    
+    """Wrist-relative normalization — MUST match 1_collect_data.py exactly."""
+    if results.left_hand_landmarks:
+        lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark])
+        lh = (lh - lh[0]).flatten()  # Subtract wrist (landmark 0)
+    else:
+        lh = np.zeros(21 * 3)
+
+    if results.right_hand_landmarks:
+        rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark])
+        rh = (rh - rh[0]).flatten()  # Subtract wrist (landmark 0)
+    else:
+        rh = np.zeros(21 * 3)
+
     return np.concatenate([lh, rh])
 
 # =============================================================================
@@ -128,28 +138,45 @@ class CameraThread(QThread):
                     if len(predictions) >= 10:
                         predictions = predictions[-10:]
                         
-                        # If the AI has guessed the *exact same* sign for the last 10 frames consecutively
-                        majority_vote = np.unique(predictions[-10:])[0] 
-                        if np.all(np.array(predictions[-10:]) == majority_vote):
-                            
-                            # CONFIDENCE THRESHOLD: 90%
-                            if res[majority_vote] > 0.90:
-                                current_sign = actions[majority_vote]
+                        # Find the most frequently predicted class over the last 10 frames
+                        majority_vote = np.bincount(predictions[-10:]).argmax()
+                        
+                        # CONFIDENCE THRESHOLD: 75% — appropriate for ~50 seqs per sign
+                        # Raise to 0.85+ once you have 100+ seqs per sign
+                        if res[majority_vote] > 0.75:
+                            detected = actions[majority_vote]
+                            # Suppress the idle/null class — it means "no sign"
+                            if detected.lower() != "idle":
+                                current_sign = detected
                     
                 # Debounce/Cooldown Logic
                 now = time.time()
-                if current_sign and current_sign != "" and current_sign != last_spoken and (now - last_spoken_time) > TTS_COOLDOWN:
+                if current_sign and current_sign != last_spoken and (now - last_spoken_time) > TTS_COOLDOWN:
                     self.sign_detected_signal.emit(current_sign)
                     last_spoken = current_sign
                     last_spoken_time = now
-                elif current_sign == "":
-                    # Reset if no sign is confidently and consecutively detected
-                    pass
-                
-                # Convert frame to Qt Format and emit
-                # Note: We emit the `frame` (BGR) but QImage expects RGB, so we swap it again, or just use the RGB we processed
+                elif not current_sign:
+                    # No confident sign detected — reset lock so same sign can fire again after a pause
+                    last_spoken = ""
+
+                # --- DEBUG OVERLAY: live confidence bars ---
+                if len(sequence) == 30 and model is not None and len(actions) > 0:
+                    bar_x, bar_y = 10, h - (len(actions) * 30) - 10
+                    for i, action in enumerate(actions):
+                        conf = float(res[i])
+                        bar_w = int(conf * 200)
+                        color = (0, 215, 100) if conf > 0.75 else (0, 150, 255)
+                        y = bar_y + i * 30
+                        cv2.rectangle(frame, (bar_x, y), (bar_x + bar_w, y + 20), color, -1)
+                        cv2.rectangle(frame, (bar_x, y), (bar_x + 200, y + 20), (180, 180, 180), 1)
+                        cv2.putText(frame, f"{action}: {conf:.0%}", (bar_x + 205, y + 15),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+                # Convert the annotated BGR frame → RGB for Qt display
+                # (rgb_frame was captured before landmarks/overlays were drawn, so use frame instead)
+                display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 bytes_per_line = ch * w
-                qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                qt_image = QImage(display_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
                 self.change_pixmap_signal.emit(qt_image)
             
         cap.release()
@@ -167,6 +194,8 @@ class AudioWorker(QThread):
         super().__init__()
         self._run_flag = True
         self.tts_q = queue.Queue()
+        # Initialize mixer once here, not on every TTS call
+        pygame.mixer.init()
         
     def speak(self, text):
         self.tts_q.put(text)
@@ -188,7 +217,6 @@ class AudioWorker(QThread):
                     audio_file = f"temp_{int(time.time())}.mp3"
                     tts.save(audio_file)
                     
-                pygame.mixer.init()
                 pygame.mixer.music.load(audio_file)
                 pygame.mixer.music.play()
                 
@@ -379,8 +407,16 @@ class SignLanguageApp(QMainWindow):
 
     def on_speech_heard(self, text):
         self.add_bubble(text, sender="hearing")
-        words = text.lower().split()
-        for word in words:
+        text_lower = text.lower()
+
+        # 1. Try full phrase first — handles multi-word signs like "what's up"
+        full_gif = os.path.join("sign_gifs", f"{text_lower}.gif")
+        if os.path.exists(full_gif):
+            self.play_avatar_gif(full_gif)
+            return
+
+        # 2. Fall back to individual words for single-word signs
+        for word in text_lower.split():
             clean_word = ''.join(e for e in word if e.isalnum())
             gif_path = os.path.join("sign_gifs", f"{clean_word}.gif")
             if os.path.exists(gif_path):

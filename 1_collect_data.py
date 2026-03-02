@@ -8,7 +8,7 @@ import imageio
 
 # Configuration
 DATASET_PATH    = os.path.join("dataset")
-NO_SEQUENCES    = 15 # Number of videos per sign
+NO_SEQUENCES    = 50 # Number of videos per sign
 SEQUENCE_LENGTH = 30 # Frames per video
 CAMERA_INDEX    = 1
 
@@ -47,10 +47,24 @@ def get_camera():
     return None
 
 def extract_keypoints(results):
-    """Extracts exactly 126 features: 63 (Left) + 63 (Right)"""
-    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
-    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
-    
+    """Extracts 126 wrist-relative features: 63 (Left) + 63 (Right).
+    Normalizing to the wrist makes the model position-invariant —
+    it learns the shape and motion of the sign, not where on screen the hand is.
+    """
+    if results.left_hand_landmarks:
+        lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark])
+        wrist_l = lh[0]  # Landmark 0 is the wrist
+        lh = (lh - wrist_l).flatten()
+    else:
+        lh = np.zeros(21 * 3)
+
+    if results.right_hand_landmarks:
+        rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark])
+        wrist_r = rh[0]  # Landmark 0 is the wrist
+        rh = (rh - wrist_r).flatten()
+    else:
+        rh = np.zeros(21 * 3)
+
     return np.concatenate([lh, rh])
 
 def main():
@@ -142,8 +156,6 @@ def main():
                     mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
                 if results.right_hand_landmarks:
                     mp_drawing.draw_landmarks(frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
-                
-                # We won't draw face mesh as it gets too cluttered, just verify we extract it
                 
                 # Capture GIF frames during the VERY FIRST sequence only (resize to save space)
                 if sequence == 0 and frame_num % 2 == 0:

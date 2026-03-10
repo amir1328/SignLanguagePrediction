@@ -25,7 +25,7 @@ else:
     print("[!] No GPU found, falling back to CPU.")
 
 DATASET_PATH    = "dataset"
-MODEL_FILE      = "sign_lstm_model.keras"
+MODEL_FILE      = "sign_lstm_model.h5"   # .h5 = cross-Keras-version compatible
 SEQUENCE_LENGTH = 30
 
 # =============================================================================
@@ -317,10 +317,12 @@ def main():
     print(f" 📊 Final Test Loss     : {loss:.4f}")
     print(f"{'='*56}")
 
-    # Save final model
-    model.save(MODEL_FILE)
+    # Save in .h5 (cross-version compatible) AND .keras (native, current version)
+    model.save(MODEL_FILE)                         # -> sign_lstm_model.h5
+    model.save(MODEL_FILE.replace('.h5', '.keras')) # -> sign_lstm_model.keras (backup)
     np.save('actions.npy', actions)
-    print(f"\n[✔] Model saved → '{MODEL_FILE}'")
+    print(f"\n[✔] Model saved → '{MODEL_FILE}' (cross-version .h5)")
+    print(f"[✔] Backup saved → 'sign_lstm_model.keras'")
     print(f"[✔] Actions map saved → 'actions.npy'")
     print(f"\n[✔] SUCCESS! Ready to run the app: python 3_app_ui.py")
 

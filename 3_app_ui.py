@@ -84,11 +84,25 @@ class CameraThread(QThread):
         if not cap:
             return
             
-        # Load Model INSIDE thread to avoid TensorFlow graph crossing
-        if os.path.exists(self.model_file):
-            model = tf.keras.models.load_model(self.model_file)
-        else:
-            model = None
+        # Version-safe model loading:
+        # .h5 is the recommended cross-Keras-version format.
+        # .keras (native) is version-specific and may fail on different machines.
+        model = None
+        for candidate in ['sign_lstm_model.h5', 'sign_lstm_model.keras', self.model_file]:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                model = tf.keras.models.load_model(candidate)
+                print(f"[Model] Loaded from '{candidate}'")
+                break
+            except Exception as e:
+                print(f"[Model] Could not load '{candidate}': {e}")
+
+        if model is None:
+            print("[Model] ERROR: Could not load any model file.")
+            print("  → Keras version mismatch detected. Please re-run:")
+            print("      python 2_train_model.py")
+            print("  on THIS machine to generate a compatible model.")
             
         actions = np.load('actions.npy') if os.path.exists('actions.npy') else []
         

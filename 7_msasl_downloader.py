@@ -23,8 +23,18 @@ import shutil
 import cv2
 import numpy as np
 import mediapipe as mp
+import os
+import sys
+import json
+import argparse
+import tempfile
+import shutil
+import cv2
+import numpy as np
+import mediapipe as mp
 from pathlib import Path
 from collections import Counter
+from gtts import gTTS
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MSASL_DIR      = r"C:\Users\AMEER AKBAR\Downloads\MS-ASL\MS-ASL"
@@ -125,7 +135,7 @@ def download_clip(url, start_time, end_time, out_path):
             max(0, start_time - 0.3),
             end_time + 0.3
         )
-        clip.write_videofile(out_path, verbose=False, logger=None)
+        clip.write_videofile(out_path, audio=False, verbose=False, logger=None)
         clip.close()
         return True
 
@@ -197,6 +207,18 @@ def run(words=None, labels=None, top_n=None, max_per_sign=CLIPS_PER_SIGN):
         stats = {}
         for sign_text, sign_entries in sorted(by_sign.items()):
 
+            # 1. Generate TTS Audio if it doesn't exist
+            audio_dir = Path("audio_signs")
+            audio_dir.mkdir(exist_ok=True)
+            audio_path = audio_dir / f"{sign_text}.mp3"
+            if not audio_path.exists():
+                print(f"  [+] Generating new TTS voice: {audio_path}")
+                try:
+                    tts = gTTS(text=sign_text, lang='en', slow=False)
+                    tts.save(str(audio_path))
+                except Exception as e:
+                    print(f"  [!] Failed to generate TTS: {e}")
+
             out_dir = Path(DATASET_PATH) / sign_text
             out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -229,6 +251,17 @@ def run(words=None, labels=None, top_n=None, max_per_sign=CLIPS_PER_SIGN):
                     continue
 
                 sequence = video_to_sequence(tmp_clip, holistic)
+
+                # If this is the very first successful clip for this sign, 
+                # keep a copy of it in sign_gifs/ so we can see what it looks like!
+                if sequence is not None and saved == 0:
+                    gif_dir = Path("sign_gifs")
+                    gif_dir.mkdir(exist_ok=True)
+                    gif_path = gif_dir / f"{sign_text}.mp4"
+                    if not gif_path.exists():
+                        shutil.copy2(tmp_clip, gif_path)
+                        print(f"  [+] Saved dictionary video: {gif_path}")
+
                 os.remove(tmp_clip)
 
                 if sequence is None:

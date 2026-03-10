@@ -1,14 +1,9 @@
 
-dataset.csv
-sign_model.pkl
-
-audio_signs/
-sign_gifs/
-
+# Python cache
 __pycache__/
 *.pyc
 .env
-*.keras
-*.npy
-dataset/
-*.mp4
+
+# Old/unused model formats
+sign_model.pkl
+dataset.csv

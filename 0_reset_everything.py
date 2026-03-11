@@ -44,12 +44,17 @@ if confirmation.lower() == 'y':
     
     # 2. Delete files
     delete_file("sign_lstm_model.keras")
+    delete_file("sign_lstm_model.h5")
     delete_file("actions.npy")
+    delete_file("sign_zones.json")
+    delete_file("sign_translation.mp4")
     
     print("\n[OK] Reset complete! Your project is now a clean slate.")
     print("Next steps:")
-    print("  1. python 1_collect_data.py       (to record your own signs)")
-    print("  2. python 7_msasl_downloader.py   (to download public signs)")
-    print("  3. python 2_train_model.py        (to train the new brain)")
+    print("  1. python 7_msasl_downloader.py   (download signs from MS-ASL)")
+    print("     - or -")
+    print("  1. python 1_collect_data.py       (record your own signs)")
+    print("  2. python 2_train_model.py        (train the model)")
+    print("  3. python 3_app_ui.py             (run the app)")
 else:
     print("\nReset Cancelled. Your files are safe.")

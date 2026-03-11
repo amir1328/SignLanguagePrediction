@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import json
 import queue
 import threading
 import numpy as np
@@ -19,9 +20,22 @@ from PyQt5.QtWidgets import (
     QLabel, QScrollArea, QFrame, QSizePolicy
 )
 
+try:
+    from asl_gloss import english_to_asl, asl_gloss_string
+except ImportError:
+    def english_to_asl(text): return text.lower().split()
+    def asl_gloss_string(text): return text.upper()
+
 # Configuration
-MODEL_FILE         = "sign_lstm_model.keras"
-TTS_COOLDOWN       = 1.5
+MODEL_FILE           = "sign_lstm_model.keras"
+SIGN_ZONES_FILE      = "sign_zones.json"
+TTS_COOLDOWN         = 1.5
+CONFIDENCE_THRESHOLD = 0.85   # Raised from 0.75 for more reliable predictions
+VOTE_WINDOW          = 15     # Majority vote over last N frames (was 10)
+CONSEC_REQUIRED      = 5      # Consecutive same-sign frames required before emitting
+MIN_HAND_FRAMES      = 15     # Min frames with real hand data in the 30-frame window
+HAND_LOSS_RESET_SEC  = 1.0    # Reset buffer after this many seconds without a hand
+ZONE_PENALTY         = 0.10   # Confidence penalty when hand is outside expected zone (reduced from 0.20)
 
 # Enable GPU Memory Growth for TensorFlow to prevent UI freezing / VRAM crashing
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -38,17 +52,49 @@ def extract_keypoints(results):
     """Wrist-relative normalization — MUST match 1_collect_data.py exactly."""
     if results.left_hand_landmarks:
         lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark])
-        lh = (lh - lh[0]).flatten()  # Subtract wrist (landmark 0)
+        lh = (lh - lh[0]).flatten()
     else:
         lh = np.zeros(21 * 3)
 
     if results.right_hand_landmarks:
         rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark])
-        rh = (rh - rh[0]).flatten()  # Subtract wrist (landmark 0)
+        rh = (rh - rh[0]).flatten()
     else:
         rh = np.zeros(21 * 3)
 
     return np.concatenate([lh, rh])
+
+def has_any_hand(results):
+    return results.left_hand_landmarks is not None or results.right_hand_landmarks is not None
+
+def get_wrist_pos(results):
+    """Return absolute (x, y) wrist position of the most visible hand."""
+    if results.right_hand_landmarks:
+        lm = results.right_hand_landmarks.landmark[0]
+        return (lm.x, lm.y)
+    if results.left_hand_landmarks:
+        lm = results.left_hand_landmarks.landmark[0]
+        return (lm.x, lm.y)
+    return None
+
+def load_sign_zones():
+    if os.path.exists(SIGN_ZONES_FILE):
+        with open(SIGN_ZONES_FILE) as f:
+            return json.load(f)
+    return {}
+
+def zone_confidence_multiplier(sign_name, wrist_pos, sign_zones):
+    """
+    Returns 1.0 if the wrist is inside the expected zone for this sign,
+    or (1.0 - ZONE_PENALTY) if it's outside. No zone data → always 1.0.
+    """
+    if wrist_pos is None or sign_name not in sign_zones:
+        return 1.0
+    zone = sign_zones[sign_name]
+    x_ok = zone['x'][0] <= wrist_pos[0] <= zone['x'][1]
+    y_ok = zone['y'][0] <= wrist_pos[1] <= zone['y'][1]
+    return 1.0 if (x_ok and y_ok) else (1.0 - ZONE_PENALTY)
+
 
 # =============================================================================
 # 1. Camera Handling
@@ -66,8 +112,83 @@ def get_camera():
     return None
 
 # =============================================================================
-# 2. Qt Threads for Hardware & AI
+# 0. Multimedia Helpers (MP4 / GIF Support)
 # =============================================================================
+
+class VideoPlayerThread(QThread):
+    frame_signal = pyqtSignal(QImage)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self._run_flag = True
+
+    def run(self):
+        cap = cv2.VideoCapture(self.path)
+        if not cap.isOpened():
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        delay = 1.0 / fps
+
+        while self._run_flag:
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            self.frame_signal.emit(qt_img.copy())
+            time.sleep(delay)
+
+        cap.release()
+
+    def stop(self):
+        self._run_flag = False
+        self.wait()
+
+class AvatarView(QLabel):
+    """A QLabel that can play either a QMovie (GIF) or a VideoPlayerThread (MP4)."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(200, 150)
+        self.setStyleSheet("background-color: #000; border: 2px solid #00d7ff; border-radius: 8px;")
+        self.setScaledContents(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.movie = None
+        self.vid_thread = None
+        self.current_path = None
+        self.hide()
+
+    def play(self, path):
+        self.stop()
+        self.current_path = path
+        self.show()
+
+        if path.lower().endswith(('.mp4', '.avi', '.mov')):
+            self.vid_thread = VideoPlayerThread(path)
+            self.vid_thread.frame_signal.connect(self.update_frame)
+            self.vid_thread.start()
+        else:
+            self.movie = QMovie(path)
+            self.setMovie(self.movie)
+            self.movie.start()
+
+    def update_frame(self, qimg):
+        self.setPixmap(QPixmap.fromImage(qimg))
+
+    def stop(self):
+        if self.movie:
+            self.movie.stop()
+            self.movie = None
+        if self.vid_thread:
+            self.vid_thread.stop()
+            self.vid_thread = None
+        self.clear()
+        self.hide()
+        self.current_path = None
 
 class CameraThread(QThread):
     """Processes OpenCV and MediaPipe Holistic data on a background thread."""
@@ -105,96 +226,155 @@ class CameraThread(QThread):
             print("  on THIS machine to generate a compatible model.")
             
         actions = np.load('actions.npy') if os.path.exists('actions.npy') else []
-        
-        mp_holistic = mp.solutions.holistic
-        mp_draw  = mp.solutions.drawing_utils
-        
-        sequence = []
-        predictions = [] # Keep a rolling log of recent predictions
-        last_spoken = ""
-        last_spoken_time = 0.0
+        sign_zones = load_sign_zones()
+        if sign_zones:
+            print(f"[Zones] Loaded spatial zones for: {', '.join(sign_zones.keys())}")
+        else:
+            print("[Zones] No sign_zones.json found — spatial validation disabled.")
 
-        with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+        mp_holistic = mp.solutions.holistic
+        mp_draw     = mp.solutions.drawing_utils
+
+        sequence          = []       # Rolling 30-frame window of keypoint vectors
+        hand_frame_flags  = []       # Parallel bool list: True if frame had real hand data
+        predictions       = []       # Rolling majority vote log
+        consec_count      = 0        # Consecutive frames with same prediction above threshold
+        last_candidate    = ""       # Sign being confirmed across consec_count frames
+        last_spoken       = ""
+        last_spoken_time  = 0.0
+        last_hand_time    = time.time()  # Timestamp of last frame with a visible hand
+        res               = None     # Last model output (for overlay)
+
+        with mp_holistic.Holistic(min_detection_confidence=0.6, min_tracking_confidence=0.6) as holistic:
             while self._run_flag and cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     time.sleep(0.01)
                     continue
-                    
+
                 frame = cv2.flip(frame, 1)
                 h, w, ch = frame.shape
-                
+
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = holistic.process(rgb_frame)
-                
-                # Visuals
+                results   = holistic.process(rgb_frame)
+
+                # Draw hand landmarks
                 if results.left_hand_landmarks:
                     mp_draw.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
                 if results.right_hand_landmarks:
                     mp_draw.draw_landmarks(frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
-                
-                # Machine Learning Prediction Vector
+
+                hand_visible = has_any_hand(results)
+                wrist_pos    = get_wrist_pos(results)
+                now          = time.time()
+
+                # ── Gate 1: hand loss reset ────────────────────────────────────
+                if hand_visible:
+                    last_hand_time = now
+                elif (now - last_hand_time) > HAND_LOSS_RESET_SEC:
+                    # Hand has been gone > 1s — clear buffer and confirmation state
+                    sequence         = []
+                    hand_frame_flags = []
+                    predictions      = []
+                    consec_count     = 0
+                    last_candidate   = ""
+                    last_spoken      = ""
+
+                # ── Accumulate keypoints ───────────────────────────────────────
                 keypoints = extract_keypoints(results)
                 sequence.append(keypoints)
-                sequence = sequence[-30:] # Rolling window of 30 frames
-                
+                hand_frame_flags.append(hand_visible)
+                sequence          = sequence[-30:]
+                hand_frame_flags  = hand_frame_flags[-30:]
+
                 current_sign = ""
-                
-                # Only predict if we have a full rolling window of 30 frames AND the model exists
-                if len(sequence) == 30 and model is not None and len(actions) > 0:
-                    # Keras expects (batches, timesteps, features)
+
+                # ── Gate 2: only predict if enough real hand data in window ────
+                real_hand_count = sum(hand_frame_flags)
+                can_predict = (
+                    len(sequence) == 30
+                    and model is not None
+                    and len(actions) > 0
+                    and real_hand_count >= MIN_HAND_FRAMES
+                )
+
+                if can_predict:
                     res = model.predict(np.expand_dims(sequence, axis=0), verbose=0)[0]
-                    # Log the index of what the AI thought
                     predictions.append(np.argmax(res))
-                    
-                    # We only analyze the last 10 predictions 
-                    # This prevents rapid "flickering" between two similar signs mid-motion
-                    if len(predictions) >= 10:
-                        predictions = predictions[-10:]
-                        
-                        # Find the most frequently predicted class over the last 10 frames
-                        majority_vote = np.bincount(predictions[-10:]).argmax()
-                        
-                        # CONFIDENCE THRESHOLD: 75% — appropriate for ~50 seqs per sign
-                        # Raise to 0.85+ once you have 100+ seqs per sign
-                        if res[majority_vote] > 0.75:
-                            detected = actions[majority_vote]
-                            # Suppress the idle/null class — it means "no sign"
-                            if detected.lower() != "idle":
-                                current_sign = detected
-                    
-                # Debounce/Cooldown Logic
-                now = time.time()
+                    predictions = predictions[-VOTE_WINDOW:]
+
+                    if len(predictions) >= VOTE_WINDOW:
+                        majority_idx  = np.bincount(predictions).argmax()
+                        raw_conf      = float(res[majority_idx])
+                        detected_sign = str(actions[majority_idx])
+
+                        # ── Gate 3: spatial zone validation ───────────────────
+                        zone_mult     = zone_confidence_multiplier(detected_sign, wrist_pos, sign_zones)
+                        adj_conf      = raw_conf * zone_mult
+                        in_zone       = (zone_mult == 1.0)
+
+                        if adj_conf > CONFIDENCE_THRESHOLD and detected_sign.lower() != "idle":
+                            # ── Gate 4: consecutive-frame confirmation ─────────
+                            if detected_sign == last_candidate:
+                                consec_count += 1
+                            else:
+                                last_candidate = detected_sign
+                                consec_count   = 1
+
+                            if consec_count >= CONSEC_REQUIRED:
+                                current_sign = detected_sign
+                        else:
+                            consec_count   = 0
+                            last_candidate = ""
+
+                        # ── Confidence bar overlay ─────────────────────────────
+                        bar_x = 10
+                        bar_y = h - (len(actions) * 28) - 10
+                        for i, action in enumerate(actions):
+                            c = float(res[i]) * zone_confidence_multiplier(str(action), wrist_pos, sign_zones)
+                            bw = int(c * 180)
+                            color = (0, 200, 80) if c > CONFIDENCE_THRESHOLD else (0, 130, 255)
+                            y = bar_y + i * 28
+                            cv2.rectangle(frame, (bar_x, y), (bar_x + bw, y + 18), color, -1)
+                            cv2.rectangle(frame, (bar_x, y), (bar_x + 180, y + 18), (160, 160, 160), 1)
+                            cv2.putText(frame, f"{action}: {c:.0%}",
+                                        (bar_x + 185, y + 13),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
+
+                        # ── Zone status indicator ──────────────────────────────
+                        zone_text  = "ZONE OK" if in_zone else "OUT OF ZONE"
+                        zone_color = (0, 200, 80) if in_zone else (0, 100, 255)
+                        cv2.putText(frame, zone_text, (w - 160, h - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, zone_color, 2)
+
+                # ── No hand overlay ────────────────────────────────────────────
+                if not hand_visible:
+                    cv2.putText(frame, "NO HAND DETECTED", (w // 2 - 120, 40),
+                                cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 80, 255), 2)
+
+                # ── Hand frame quality bar (top-right) ────────────────────────
+                if len(hand_frame_flags) > 0:
+                    quality = sum(hand_frame_flags) / len(hand_frame_flags)
+                    q_color = (0, 200, 80) if quality >= 0.5 else (0, 100, 255)
+                    cv2.putText(frame, f"Hand: {quality:.0%}", (w - 130, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, q_color, 2)
+
+                # ── Debounce / emit ────────────────────────────────────────────
                 if current_sign and current_sign != last_spoken and (now - last_spoken_time) > TTS_COOLDOWN:
                     self.sign_detected_signal.emit(current_sign)
-                    last_spoken = current_sign
+                    last_spoken      = current_sign
                     last_spoken_time = now
                 elif not current_sign:
-                    # No confident sign detected — reset lock so same sign can fire again after a pause
                     last_spoken = ""
 
-                # --- DEBUG OVERLAY: live confidence bars ---
-                if len(sequence) == 30 and model is not None and len(actions) > 0:
-                    bar_x, bar_y = 10, h - (len(actions) * 30) - 10
-                    for i, action in enumerate(actions):
-                        conf = float(res[i])
-                        bar_w = int(conf * 200)
-                        color = (0, 215, 100) if conf > 0.75 else (0, 150, 255)
-                        y = bar_y + i * 30
-                        cv2.rectangle(frame, (bar_x, y), (bar_x + bar_w, y + 20), color, -1)
-                        cv2.rectangle(frame, (bar_x, y), (bar_x + 200, y + 20), (180, 180, 180), 1)
-                        cv2.putText(frame, f"{action}: {conf:.0%}", (bar_x + 205, y + 15),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-
-                # Convert the annotated BGR frame → RGB for Qt display
-                # (rgb_frame was captured before landmarks/overlays were drawn, so use frame instead)
-                display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Qt frame emit
+                display_frame  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 bytes_per_line = ch * w
                 qt_image = QImage(display_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
                 self.change_pixmap_signal.emit(qt_image)
-            
+
         cap.release()
-        
+
     def stop(self):
         self._run_flag = False
         self.wait()
@@ -314,23 +494,16 @@ class SignLanguageApp(QMainWindow):
         
         left_layout.addWidget(self.video_label)
         
-        # Avatar GIF Queue Layout (up to 3 recent signs)
+        # Avatar GIF/MP4 Queue Layout (up to 3 recent signs)
         self.avatar_container = QWidget()
         self.avatar_layout = QHBoxLayout(self.avatar_container)
         self.avatar_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.avatar_labels = []
-        self.movies = [None, None, None]
-        self.avatar_paths = [None, None, None]
+        self.avatars = []
         for _ in range(3):
-            lbl = QLabel()
-            lbl.setFixedSize(200, 150)
-            lbl.setStyleSheet("background-color: transparent; border: 2px solid #00d7ff; border-radius: 8px;")
-            lbl.setScaledContents(True)
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.hide()
-            self.avatar_layout.addWidget(lbl)
-            self.avatar_labels.append(lbl)
+            av = AvatarView()
+            self.avatar_layout.addWidget(av)
+            self.avatars.append(av)
             
         left_layout.addWidget(self.avatar_container, alignment=Qt.AlignCenter)
         
@@ -420,47 +593,53 @@ class SignLanguageApp(QMainWindow):
         self.audio_thread.speak(sign_text)
 
     def on_speech_heard(self, text):
+        # 1. Show bubble in chat
         self.add_bubble(text, sender="hearing")
-        text_lower = text.lower()
-
-        # 1. Try full phrase first — handles multi-word signs like "what's up"
-        full_gif = os.path.join("sign_gifs", f"{text_lower}.gif")
-        if os.path.exists(full_gif):
-            self.play_avatar_gif(full_gif)
-            return
-
-        # 2. Fall back to individual words for single-word signs
-        for word in text_lower.split():
-            clean_word = ''.join(e for e in word if e.isalnum())
-            gif_path = os.path.join("sign_gifs", f"{clean_word}.gif")
-            if os.path.exists(gif_path):
-                self.play_avatar_gif(gif_path)
-
-    def play_avatar_gif(self, path):
-        self.avatar_paths = [path, self.avatar_paths[0], self.avatar_paths[1]]
-        for i in range(3):
-            if self.movies[i]:
-                self.movies[i].stop()
-            p = self.avatar_paths[i]
-            if p and os.path.exists(p):
-                self.movies[i] = QMovie(p)
-                self.avatar_labels[i].setMovie(self.movies[i])
-                self.avatar_labels[i].show()
-                self.movies[i].start()
-            else:
-                self.movies[i] = None
-                self.avatar_labels[i].clear()
-                self.avatar_labels[i].hide()
-        QApplication.processEvents()
         
+        # 2. Convert to ASL Gloss for matching
+        gloss_tokens = english_to_asl(text)
+        self.status_label.setText(f"💬 ASL Gloss: {' '.join(gloss_tokens).upper()}")
+
+        # 3. Match and display signs
+        for token in gloss_tokens:
+            token = token.lower()
+            found_path = None
+            
+            # Check local dictionary (GIF or MP4)
+            for ext in ['.gif', '.mp4']:
+                p = os.path.join("sign_gifs", f"{token}{ext}")
+                if os.path.exists(p):
+                    found_path = p
+                    break
+            
+            # Fallback to dataset folder (picks one sample)
+            if not found_path:
+                d_path = os.path.join("dataset", token)
+                if os.path.exists(d_path):
+                    samples = list(Path(d_path).glob("*.mp4")) or list(Path(d_path).glob("*.gif"))
+                    # If neither, maybe check .npy preview logic? 
+                    # For now just use first video match
+                    if samples:
+                        found_path = str(samples[0])
+            
+            if found_path:
+                self.play_avatar_sign(found_path)
+
+    def play_avatar_sign(self, path):
+        # Shift old signs to the right
+        # We need to stop the oldest, move the rest
+        paths = [av.current_path for av in self.avatars]
+        new_paths = [path, paths[0], paths[1]]
+
+        for i, p in enumerate(new_paths):
+            if p:
+                self.avatars[i].play(p)
+            else:
+                self.avatars[i].stop()
+
     def hide_all_avatar_gifs(self):
-        self.avatar_paths = [None, None, None]
-        for i in range(3):
-            if self.movies[i]:
-                self.movies[i].stop()
-                self.movies[i] = None
-            self.avatar_labels[i].clear()
-            self.avatar_labels[i].hide()
+        for av in self.avatars:
+            av.stop()
 
     def closeEvent(self, event):
         self.camera_thread.stop()

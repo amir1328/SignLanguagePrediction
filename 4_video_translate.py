@@ -19,7 +19,14 @@ from PyQt5.QtMultimediaWidgets import QVideoWidget
 
 GIF_DIR     = "sign_gifs"
 DATASET_DIR = "dataset"
-MSASL_DIR   = r"C:\Users\AMEER AKBAR\Downloads\MS-ASL\MS-ASL"
+MSASL_DIR   = "MS-ASL"                              # official (1000 signs)
+VALID25_DIR = "MSASL-valid-dataset-downloader-main"  # pre-validated 25% (better URLs)
+
+try:
+    from asl_gloss import english_to_asl, asl_gloss_string
+except ImportError:
+    def english_to_asl(text): return text.lower().split()
+    def asl_gloss_string(text): return text.upper()
 
 # Accent matching 3_app_ui.py avatar border
 ACCENT   = "#00d7ff"
@@ -33,33 +40,48 @@ BG_CARD  = "#222222"
 _MSASL_INDEX = None  # word → list of {url, start_time, end_time}
 
 def _load_msasl_index():
-    """Load MS-ASL JSON(s) into a word → entries dict. Returns {} on failure."""
+    """Load both MS-ASL sources into a word → entries dict. valid-25% entries come first."""
     global _MSASL_INDEX
     if _MSASL_INDEX is not None:
         return _MSASL_INDEX
     import json
     index = {}
-    for fname in ("MSASL_train.json", "MSASL_val.json"):
-        fpath = os.path.join(MSASL_DIR, fname)
+
+    def _ingest(fpath, text_key):
         if not os.path.exists(fpath):
-            continue
+            return
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                entries = json.load(f)
-            for e in entries:
-                word = e.get("text", "").lower().strip()
-                if word:
-                    index.setdefault(word, []).append(e)
+            with open(fpath, 'r', encoding='utf-8') as f:
+                for e in json.load(f):
+                    if not isinstance(e, dict):
+                        continue
+                    word = (e.get(text_key) or e.get('text') or '').lower().strip()
+                    if word:
+                        entry = {
+                            'url':        e.get('url', ''),
+                            'start_time': float(e.get('start_time', 0) or 0),
+                            'end_time':   float(e.get('end_time', 3) or 3),
+                        }
+                        index.setdefault(word, []).append(entry)
         except Exception:
             pass
+
+    # Tier A: valid-25% first (pre-verified URLs, clean_text field)
+    for fname in ('MSASL_TRAIN25.json', 'MSASL_VAL25.json', 'MASL_TEST25.json'):
+        _ingest(os.path.join(VALID25_DIR, fname), 'clean_text')
+
+    # Tier B: official MS-ASL for words not already covered
+    for fname in ('MSASL_train.json', 'MSASL_val.json'):
+        _ingest(os.path.join(MSASL_DIR, fname), 'text')
+
     _MSASL_INDEX = index
     return index
 
 
 def _try_download_msasl_clip(word):
     """
-    Try to download the first working MS-ASL YouTube clip for `word`
-    and save it as sign_gifs/<word>.mp4. Returns the path on success, None on failure.
+    Try to download the first working MS-ASL clip for `word` (valid-25% first,
+    then official MS-ASL). Saves to sign_gifs/<word>.mp4. Returns path or None.
     """
     index = _load_msasl_index()
     entries = index.get(word.lower(), [])
@@ -69,23 +91,22 @@ def _try_download_msasl_clip(word):
     try:
         import yt_dlp
         from moviepy.editor import VideoFileClip
-        import tempfile, shutil
+        import shutil
     except ImportError:
         return None
 
     os.makedirs(GIF_DIR, exist_ok=True)
     out_path = os.path.join(GIF_DIR, f"{word}.mp4")
 
-    for entry in entries[:10]:  # Try up to 10 entries per word
+    for entry in entries[:10]:
         url        = entry.get("url", "")
-        start_time = entry.get("start_time", 0)
-        end_time   = entry.get("end_time", start_time + 3)
+        start_time = float(entry.get("start_time", 0) or 0)
+        end_time   = float(entry.get("end_time", start_time + 3) or start_time + 3)
         if not url.startswith("http"):
             url = "https://" + url
 
         tmp_dir  = tempfile.mkdtemp()
         tmp_file = os.path.join(tmp_dir, "raw.%(ext)s")
-
         try:
             ydl_opts = {
                 "format": "best[ext=mp4][height<=480]/best[ext=mp4]/best[height<=480]/best",
@@ -95,75 +116,284 @@ def _try_download_msasl_clip(word):
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-
             raw = next(
                 (os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.startswith("raw")),
                 None
             )
             if not raw:
                 continue
-
             clip = VideoFileClip(raw).subclip(max(0, start_time - 0.3), end_time + 0.3)
             clip.write_videofile(out_path, audio=False, verbose=False, logger=None)
             clip.close()
             return out_path
-
         except Exception:
             continue
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            import shutil as _sh
+            _sh.rmtree(tmp_dir, ignore_errors=True)
 
     return None
 
 
+
+def _find_hand_active_segment(video_path, min_duration=1.5, sample_every=3):
+    """
+    Scan a video with MediaPipe Hands and return (start_sec, end_sec) of the
+    LONGEST contiguous segment where hands are detected.
+    Returns (None, None) if no hand activity found.
+
+    sample_every: only process every Nth frame for speed (3 = 10fps on 30fps video).
+    """
+    import mediapipe as mp
+    mp_hands = mp.solutions.hands
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None, None
+
+    fps       = cap.get(cv2.CAP_PROP_FPS) or 30
+    frame_idx = 0
+    hand_timestamps = []  # seconds where a hand was detected
+
+    with mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as hands:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % sample_every == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = hands.process(rgb)
+                if results.multi_hand_landmarks:
+                    hand_timestamps.append(frame_idx / fps)
+            frame_idx += 1
+
+    cap.release()
+
+    if not hand_timestamps:
+        return None, None
+
+    # Find longest contiguous run of hand-active timestamps (gap ≤ 1s allowed)
+    GAP_TOLERANCE = 1.0  # seconds — brief occlusions are OK
+    best_start = hand_timestamps[0]
+    best_end   = hand_timestamps[0]
+    cur_start  = hand_timestamps[0]
+    cur_end    = hand_timestamps[0]
+
+    for t in hand_timestamps[1:]:
+        if t - cur_end <= GAP_TOLERANCE:
+            cur_end = t
+        else:
+            if (cur_end - cur_start) > (best_end - best_start):
+                best_start, best_end = cur_start, cur_end
+            cur_start = cur_end = t
+
+    if (cur_end - cur_start) > (best_end - best_start):
+        best_start, best_end = cur_start, cur_end
+
+    duration = best_end - best_start
+    if duration < min_duration:
+        return None, None
+
+    return best_start, best_end
+
+
+def _try_youtube_asl_search(word):
+    """
+    Tier 4 fallback — single words ONLY.
+
+    Phase 1: Collect candidate video IDs from up to 3 search queries (no download yet).
+    Phase 2: Download each candidate to a temp file, scan with MediaPipe to measure
+             the length of the hand-active window.
+    Phase 3: Keep only the candidate with the LONGEST hand-active segment,
+             clip to that window ± 0.5s, and save to sign_gifs/<word>.mp4.
+
+    Slower than first-success but produces the clearest sign demonstration.
+    Results are cached in sign_gifs/ so the cost is only paid once per word.
+    """
+    # ── Gate: only for single words ───────────────────────────────────────────
+    if len(word.split()) > 1:
+        return None
+
+    try:
+        import yt_dlp
+        from moviepy.editor import VideoFileClip
+        import shutil
+    except ImportError:
+        return None
+
+    os.makedirs(GIF_DIR, exist_ok=True)
+    out_path = os.path.join(GIF_DIR, f"{word}.mp4")
+
+    # Instant cache hit
+    if os.path.exists(out_path):
+        return out_path
+
+    queries = [
+        f"{word} ASL sign language",
+        f"how to sign {word} ASL",
+        f"{word} American Sign Language",
+    ]
+
+    # ── Phase 1: collect candidate video URLs (metadata only, no download) ────
+    print(f"  [🔍] Collecting YouTube candidates for '{word}'...")
+    seen_ids  = set()
+    candidates = []   # list of YouTube watch URLs
+
+    info_opts = {
+        "quiet":       True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat":  True,      # metadata only — very fast
+        "match_filter": yt_dlp.utils.match_filter_func("duration < 180"),
+    }
+    with yt_dlp.YoutubeDL(info_opts) as ydl:
+        for query in queries:
+            try:
+                info = ydl.extract_info(f"ytsearch3:{query}", download=False)
+                for entry in (info.get("entries") or []):
+                    vid_id = entry.get("id") or entry.get("url", "")
+                    if vid_id and vid_id not in seen_ids:
+                        seen_ids.add(vid_id)
+                        candidates.append(f"https://www.youtube.com/watch?v={vid_id}")
+            except Exception:
+                continue
+
+    if not candidates:
+        print(f"  [!] No YouTube candidates found for '{word}'")
+        return None
+
+    print(f"  [📋] {len(candidates)} unique candidates — scanning all for best hand activity...")
+
+    # ── Phase 2: download each candidate, measure hand-active duration ────────
+    best_raw      = None
+    best_seg      = (0.0, 5.0)
+    best_duration = -1.0
+    tmp_dirs      = []
+
+    for i, url in enumerate(candidates):
+        tmp_dir  = tempfile.mkdtemp()
+        tmp_dirs.append(tmp_dir)
+        tmp_file = os.path.join(tmp_dir, f"cand{i}.%(ext)s")
+        try:
+            dl_opts = {
+                "format":      "best[ext=mp4][height<=480]/best[ext=mp4]/best",
+                "outtmpl":     tmp_file,
+                "quiet":       True,
+                "no_warnings": True,
+                "noplaylist":  True,
+            }
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                ydl.download([url])
+
+            raw = next(
+                (os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)
+                 if f.startswith(f"cand{i}")),
+                None
+            )
+            if not raw or not os.path.exists(raw):
+                continue
+
+            seg_start, seg_end = _find_hand_active_segment(raw)
+            MAX_CLIP = 12.0  # cap: even a 3-min tutorial has one sign per ~5-10s
+            if seg_start is not None:
+                # Clamp to 12s max — avoids picking a 60s general tutorial
+                capped_dur = min(seg_end - seg_start, MAX_CLIP)
+            else:
+                capped_dur = 0.0
+            hand_dur = capped_dur
+            print(f"    Candidate {i+1}: hand-active {hand_dur:.1f}s  ({url.split('=')[-1]})")
+
+            if hand_dur > best_duration:
+                best_duration = hand_dur
+                best_raw      = raw
+                if seg_start is not None:
+                    best_seg = (seg_start, seg_start + capped_dur)
+                else:
+                    best_seg = (0.0, 5.0)
+
+        except Exception as ex:
+            print(f"    Candidate {i+1}: failed — {ex}")
+            continue
+
+    # ── Phase 3: clip the winner and save ─────────────────────────────────────
+    try:
+        if best_raw and os.path.exists(best_raw):
+            seg_start, seg_end = best_seg
+            padding    = 0.5
+            clip_start = max(0.0, seg_start - padding)
+            clip_end   = seg_end + padding
+            print(f"  [✂] Best candidate: {best_duration:.1f}s hand-active — "
+                  f"clipping {clip_start:.1f}s → {clip_end:.1f}s")
+            clip = VideoFileClip(best_raw).subclip(clip_start, clip_end)
+            clip.write_videofile(out_path, audio=False, verbose=False, logger=None)
+            clip.close()
+            return out_path
+        else:
+            print(f"  [!] No usable YouTube clip found for '{word}'")
+            return None
+    except Exception as ex:
+        print(f"  [!] Failed to clip best candidate: {ex}")
+        return out_path if os.path.exists(out_path) else None
+    finally:
+        for d in tmp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 # =============================================================================
-# 4. Word to Media Matcher (GIF → sign_gifs MP4 → MS-ASL on-demand → None)
+# 4. Word to Media Matcher
+#    Chain: local GIF → local MP4 → MS-ASL download → YouTube ASL search → None
 # =============================================================================
 def match_gifs(text):
-    words = text.lower().split()
-    print(f"[match_gifs] Transcript words: {words}")
+    """
+    1. Convert English → ASL gloss tokens
+    2. For each token: GIF → MP4 → MS-ASL → YouTube ASL → None
+    """
+    asl_tokens = english_to_asl(text)
+    print(f"[ASL Gloss] {' '.join(t.upper() for t in asl_tokens)}")
     results = []
     i = 0
-    while i < len(words):
+    while i < len(asl_tokens):
         matched = False
-        for length in range(min(4, len(words) - i), 0, -1):
-            phrase = " ".join(words[i:i+length])
+        for length in range(min(4, len(asl_tokens) - i), 0, -1):
+            phrase = " ".join(asl_tokens[i:i+length])
             for candidate in [phrase, ''.join(c for c in phrase if c.isalnum() or c == ' ').strip()]:
-                # Priority 1: sign_gifs/<word>.gif (from manual GIF collection)
                 gif_path = os.path.join(GIF_DIR, f"{candidate}.gif")
-                # Priority 2: sign_gifs/<word>.mp4 (saved by 7_msasl_downloader)
                 mp4_path = os.path.join(GIF_DIR, f"{candidate}.mp4")
 
                 if os.path.exists(gif_path):
                     print(f"  [✓ GIF] '{candidate}' → {gif_path}")
                     results.append((phrase, gif_path))
-                    i += length
-                    matched = True
-                    break
+                    i += length; matched = True; break
                 elif os.path.exists(mp4_path):
                     print(f"  [✓ MP4] '{candidate}' → {mp4_path}")
                     results.append((phrase, mp4_path))
-                    i += length
-                    matched = True
-                    break
+                    i += length; matched = True; break
                 else:
-                    print(f"  [?] '{candidate}' not in sign_gifs/ — trying MS-ASL...")
-                    # Priority 3: Try on-demand download from MS-ASL JSON
+                    print(f"  [?] '{candidate}' — trying MS-ASL...")
                     downloaded = _try_download_msasl_clip(candidate)
                     if downloaded:
-                        print(f"  [✓ DL]  '{candidate}' downloaded → {downloaded}")
+                        print(f"  [✓ MS-ASL] '{candidate}' → {downloaded}")
                         results.append((phrase, downloaded))
-                        i += length
-                        matched = True
-                        break
-                    else:
-                        print(f"  [✗]    '{candidate}' — no match found anywhere")
+                        i += length; matched = True; break
+
+                    print(f"  [?] '{candidate}' — trying YouTube ASL search...")
+                    yt_path = _try_youtube_asl_search(candidate)
+                    if yt_path:
+                        print(f"  [✓ YouTube] '{candidate}' → {yt_path}")
+                        results.append((phrase, yt_path))
+                        i += length; matched = True; break
+
+                    print(f"  [✗] '{candidate}' — no match found anywhere")
             if matched:
                 break
         if not matched:
-            results.append((words[i], None))
+            results.append((asl_tokens[i], None))
             i += 1
-    print(f"[match_gifs] Final results: {[(w, bool(p)) for w, p in results]}")
+    print(f"[match_gifs] Final: {[(w, bool(p)) for w, p in results]}")
     return results
 
 
@@ -171,21 +401,22 @@ def match_gifs(text):
 # 5. Match Worker — runs match_gifs() in a background thread with progress
 # =============================================================================
 class MatchWorker(QThread):
-    progress_signal = pyqtSignal(int, str)    # (pct, status_msg)
-    done_signal     = pyqtSignal(list)        # full results list when complete
+    progress_signal = pyqtSignal(int, str)
+    done_signal     = pyqtSignal(list)
 
     def __init__(self, text):
         super().__init__()
         self.text = text
 
     def run(self):
-        words = self.text.lower().split()
-        total = max(len(words), 1)
-        results = []
-        i = 0
+        words    = english_to_asl(self.text)  # English → ASL gloss
+        total    = max(len(words), 1)
+        results  = []
+        i        = 0
         word_num = 0
+        print(f"[MatchWorker] ASL Gloss: {' '.join(w.upper() for w in words)}")
         while i < len(words):
-            matched = False
+            matched  = False
             word_num += 1
             pct = int((word_num / total) * 90)
             for length in range(min(4, len(words) - i), 0, -1):
@@ -193,26 +424,41 @@ class MatchWorker(QThread):
                 for candidate in [phrase, ''.join(c for c in phrase if c.isalnum() or c == ' ').strip()]:
                     gif_path = os.path.join(GIF_DIR, f"{candidate}.gif")
                     mp4_path = os.path.join(GIF_DIR, f"{candidate}.mp4")
+
+                    # Tier 1: local GIF
                     if os.path.exists(gif_path):
                         results.append((phrase, gif_path))
-                        self.progress_signal.emit(pct, f"Matched '{phrase}' ✓")
+                        self.progress_signal.emit(pct, f"✓ Local GIF '{phrase}'")
                         i += length; matched = True; break
+
+                    # Tier 2: local MP4
                     elif os.path.exists(mp4_path):
                         results.append((phrase, mp4_path))
-                        self.progress_signal.emit(pct, f"Matched '{phrase}' ✓")
+                        self.progress_signal.emit(pct, f"✓ Local MP4 '{phrase}'")
                         i += length; matched = True; break
+
+                    # Tier 3: MS-ASL on-demand (valid-25% preferred)
                     else:
-                        self.progress_signal.emit(pct, f"Searching MS-ASL for '{candidate}'...")
+                        self.progress_signal.emit(pct, f"🔍 Searching MS-ASL for '{candidate}'...")
                         downloaded = _try_download_msasl_clip(candidate)
                         if downloaded:
                             results.append((phrase, downloaded))
-                            self.progress_signal.emit(pct, f"Downloaded '{phrase}' ↓")
+                            self.progress_signal.emit(pct, f"↓ MS-ASL '{phrase}'")
                             i += length; matched = True; break
+
+                        # Tier 4: YouTube ASL search
+                        self.progress_signal.emit(pct, f"🎬 Searching YouTube ASL for '{candidate}'...")
+                        yt_path = _try_youtube_asl_search(candidate)
+                        if yt_path:
+                            results.append((phrase, yt_path))
+                            self.progress_signal.emit(pct, f"▶ YouTube '{phrase}'")
+                            i += length; matched = True; break
+
                 if matched:
                     break
             if not matched:
                 results.append((words[i], None))
-                self.progress_signal.emit(pct, f"No sign for '{words[i]}'")
+                self.progress_signal.emit(pct, f"✗ No sign for '{words[i]}'")
                 i += 1
         self.progress_signal.emit(100, "Done.")
         self.done_signal.emit(results)

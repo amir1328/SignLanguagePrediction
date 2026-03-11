@@ -11,6 +11,13 @@ from PyQt5.QtWidgets import (
 
 GIF_DIR = "sign_gifs"
 
+try:
+    from asl_gloss import english_to_asl, asl_gloss_string
+except ImportError:
+    # Fallback: no conversion, plain split
+    def english_to_asl(text): return text.lower().split()
+    def asl_gloss_string(text): return text.upper()
+
 ACCENT   = "#00d7ff"
 BG_DARK  = "#1a1a1a"
 BG_PANEL = "#2b2b2b"
@@ -21,24 +28,31 @@ BG_CARD  = "#222222"
 # Word to GIF Matcher
 # =============================================================================
 def match_gifs(text):
-    words = text.lower().split()
+    """
+    Convert English text to ASL gloss, then match each token to a sign GIF.
+    Returns list of (word, path_or_None).
+    """
+    asl_tokens = english_to_asl(text)
+    print(f"[ASL Gloss] {' '.join(t.upper() for t in asl_tokens)}")
     results = []
     i = 0
-    while i < len(words):
+    while i < len(asl_tokens):
         matched = False
-        for length in range(min(4, len(words) - i), 0, -1):
-            phrase = " ".join(words[i:i+length])
+        for length in range(min(4, len(asl_tokens) - i), 0, -1):
+            phrase = " ".join(asl_tokens[i:i+length])
             for candidate in [phrase, ''.join(c for c in phrase if c.isalnum() or c == ' ').strip()]:
                 gif_path = os.path.join(GIF_DIR, f"{candidate}.gif")
+                mp4_path = os.path.join(GIF_DIR, f"{candidate}.mp4")
                 if os.path.exists(gif_path):
                     results.append((phrase, gif_path))
-                    i += length
-                    matched = True
-                    break
+                    i += length; matched = True; break
+                elif os.path.exists(mp4_path):
+                    results.append((phrase, mp4_path))
+                    i += length; matched = True; break
             if matched:
                 break
         if not matched:
-            results.append((words[i], None))
+            results.append((asl_tokens[i], None))
             i += 1
     return results
 
@@ -237,6 +251,7 @@ class TextToSignApp(QMainWindow):
             return
 
         self._clear_cards()
+        gloss = asl_gloss_string(text)
         matched = match_gifs(text)
 
         for word, gif_path in matched:
@@ -245,7 +260,7 @@ class TextToSignApp(QMainWindow):
         found = sum(1 for _, p in matched if p)
         total = len(matched)
         self.status_lbl.setText(
-            f"{found} of {total} words matched to signs."
+            f"ASL Gloss: {gloss}  |  {found}/{total} signs matched."
             + ("" if found == total else f"  ({total - found} words have no recorded sign yet.)")
         )
 

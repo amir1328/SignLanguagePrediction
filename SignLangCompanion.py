@@ -17,7 +17,7 @@ import traceback
 def exception_hook(exctype, value, tb):
     err_msg = ''.join(traceback.format_exception(exctype, value, tb))
     print(f'\n[CRITICAL ERROR] Application crashed!\n{err_msg}')
-    with open('crash_log.txt', 'w') as f:
+    with open('crash_log.txt', 'w', encoding='utf-8') as f:
         f.write(err_msg)
     QMessageBox.critical(None, 'Application Error', f'A fatal error occurred:\n{value}\n\nCheck crash_log.txt for details.')
     sys.exit(1)

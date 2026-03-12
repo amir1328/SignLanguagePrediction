@@ -106,7 +106,49 @@ HAND_CO = [
     (0,17)                          # Palm base
 ]
 
-def render_sign_mt_pose(text):
+def _get_pose_data(text):
+    """Internal helper to fetch pose data from API."""
+    if not HAS_POSE: return None
+    try:
+        url = f"https://us-central1-sign-mt.cloudfunctions.net/spoken_text_to_signed_pose?text={text}&spoken=en&signed=ase"
+        resp = requests.get(url, timeout=20)
+        if resp.status_code != 200: return None
+        p = Pose.read(resp.content)
+        data = p.body.data
+        if hasattr(data, 'filled'): data = data.filled(0)
+        return p, data
+    except Exception:
+        return None
+
+def fingerspell_ai(word):
+    """Combines individual alphabet signs into one fallback video."""
+    out_path = os.path.join(AI_DIR, f"{word.replace(' ', '_')}_fingerspell.mp4")
+    if os.path.exists(out_path): return out_path
+
+    print(f"[AI] Fingerspelling '{word}'...")
+    all_frames = []
+    
+    # Try to render each letter and collect frames
+    # (Simplified: we generate them and merge via imageio)
+    for char in word:
+        if not char.isalnum(): continue
+        char_path = render_sign_mt_pose(char.lower(), fallback_to_fingerspell=False)
+        if char_path and os.path.exists(char_path):
+            try:
+                reader = imageio.get_reader(char_path)
+                for frame in reader:
+                    all_frames.append(frame)
+                reader.close()
+            except Exception: pass
+    
+    if not all_frames: return None
+    
+    try:
+        imageio.mimsave(out_path, all_frames, fps=25, macro_block_size=1, codec='libx264')
+        return out_path
+    except Exception: return None
+
+def render_sign_mt_pose(text, fallback_to_fingerspell=True):
     if not HAS_POSE:
         print("[AI] pose-format not installed. Skipping.")
         return None
@@ -115,28 +157,25 @@ def render_sign_mt_pose(text):
     if os.path.exists(out_path):
         return out_path
 
+    result = _get_pose_data(text)
+    if not result:
+        if fallback_to_fingerspell and len(text) > 1:
+            return fingerspell_ai(text)
+        return None
+
     print(f"[AI] Generating skeletal animation for '{text}'...")
+    tmp_path = out_path + ".tmp.mp4"
+    out = None
     try:
-        url = f"https://us-central1-sign-mt.cloudfunctions.net/spoken_text_to_signed_pose?text={text}&spoken=en&signed=ase"
-        resp = requests.get(url, timeout=20)
-        if resp.status_code != 200:
-            print(f"[AI] API Error: {resp.status_code}")
-            return None
-
-        p = Pose.read(resp.content)
-        data = p.body.data
-        if hasattr(data, 'filled'):
-            data = data.filled(0)
-
+        p, data = result
         frames, persons, points, dims = data.shape
         w, h = 640, 480
         orig_w = p.header.dimensions.width or 512
         orig_h = p.header.dimensions.height or 512
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(out_path, fourcc, 25, (w, h))
+        out = cv2.VideoWriter(tmp_path, fourcc, 25, (w, h))
 
-        # Detect pose format offsets
         lh_off, rh_off = 33, 54
         curr_pose_co = POSE_CO
         if points == 178:
@@ -214,14 +253,26 @@ def render_sign_mt_pose(text):
             cv2.putText(img, f"SIGN: {text.upper()}", (25, 40), cv2.FONT_HERSHEY_DUPLEX, 0.6, (120, 120, 130), 1, cv2.LINE_AA)
             out.write(img)
 
-        out.release()
-        print(f"[AI] Rendered '{text}' with {point_count} total landmark instances.")
-        return out_path
+        # Success!
+        out.release(); out = None
+        if os.path.exists(tmp_path):
+            if os.path.getsize(tmp_path) > 1024:
+                os.rename(tmp_path, out_path)
+                return out_path
+            else:
+                os.remove(tmp_path)
+        return None
+
     except Exception as e:
         print(f"[AI] Render error: {e}")
         import traceback
         traceback.print_exc()
         return None
+    finally:
+        if out: out.release()
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
 def _try_download_msasl_clip(word):
     """
     Try to download the first working MS-ASL clip for `word` (valid-25% first,
@@ -548,9 +599,10 @@ class MatchWorker(QThread):
     progress_signal = pyqtSignal(int, str)
     done_signal     = pyqtSignal(list, list) # (hybrid_results, skeleton_results)
 
-    def __init__(self, text):
+    def __init__(self, text, mode="hybrid"):
         super().__init__()
         self.text = text
+        self.mode = mode
 
     def run(self):
         words    = english_to_asl(self.text)  # English → ASL gloss
@@ -568,54 +620,61 @@ class MatchWorker(QThread):
             
             # --- 1. SKELETON MODE (Always AI for the single word) ---
             word = words[i]
-            self.progress_signal.emit(pct, f"🤖 [Skeleton] AI Pose for '{word}'...")
-            sk_path = render_sign_mt_pose(word)
-            skeleton_results.append((word, sk_path))
+            sk_path = None
+            if self.mode in ("skeleton", "both"):
+                self.progress_signal.emit(pct, f"[Skeleton] AI Pose for '{word}'...")
+                sk_path = render_sign_mt_pose(word)
+                skeleton_results.append((word, sk_path))
             
             # --- 2. HYBRID MODE (Local -> MS-ASL -> YouTube -> AI) ---
-            matched = False
-            for length in range(min(4, len(words) - i), 0, -1):
-                phrase = " ".join(words[i:i+length])
-                candidate = ''.join(c for c in phrase if c.isalnum() or c == ' ').strip()
-                
-                gif_path = os.path.join(GIF_DIR, f"{candidate}.gif")
-                mp4_path = os.path.join(GIF_DIR, f"{candidate}.mp4")
+            if self.mode in ("hybrid", "both"):
+                matched = False
+                for length in range(min(4, len(words) - i), 0, -1):
+                    phrase = " ".join(words[i:i+length])
+                    candidate = ''.join(c for c in phrase if c.isalnum() or c == ' ').strip()
+                    
+                    gif_path = os.path.join(GIF_DIR, f"{candidate}.gif")
+                    mp4_path = os.path.join(GIF_DIR, f"{candidate}.mp4")
 
-                # Tiers 1 & 2: Local
-                if os.path.exists(gif_path):
-                    hybrid_results.append((phrase, gif_path))
-                    self.progress_signal.emit(pct, f"✓ Hybrid '{phrase}'")
-                    matched = True; break
-                elif os.path.exists(mp4_path):
-                    hybrid_results.append((phrase, mp4_path))
-                    self.progress_signal.emit(pct, f"✓ Hybrid '{phrase}'")
-                    matched = True; break
-                
-                # Tier 3: MS-ASL
-                dl_path = _try_download_msasl_clip(candidate)
-                if dl_path:
-                    hybrid_results.append((phrase, dl_path))
-                    self.progress_signal.emit(pct, f"↓ Hybrid '{phrase}'")
-                    matched = True; break
-                
-                # Tier 4: YouTube
-                yt_path = _try_youtube_asl_search(candidate)
-                if yt_path:
-                    hybrid_results.append((phrase, yt_path))
-                    self.progress_signal.emit(pct, f"▶ Hybrid '{phrase}'")
-                    matched = True; break
-                
-                # Tier 5: AI Pose (Only if length == 1)
-                if length == 1:
-                    # In Hybrid mode, we can reuse the sk_path we just got for Skeleton mode
-                    if sk_path:
-                        hybrid_results.append((word, sk_path))
-                        self.progress_signal.emit(pct, f"✨ Hybrid '{word}'")
+                    # Tiers 1 & 2: Local
+                    if os.path.exists(gif_path):
+                        hybrid_results.append((phrase, gif_path))
+                        self.progress_signal.emit(pct, f"✓ Hybrid '{phrase}'")
                         matched = True; break
+                    elif os.path.exists(mp4_path):
+                        hybrid_results.append((phrase, mp4_path))
+                        self.progress_signal.emit(pct, f"✓ Hybrid '{phrase}'")
+                        matched = True; break
+                    
+                    # Tier 3: MS-ASL
+                    dl_path = _try_download_msasl_clip(candidate)
+                    if dl_path:
+                        hybrid_results.append((phrase, dl_path))
+                        self.progress_signal.emit(pct, f"↓ Hybrid '{phrase}'")
+                        matched = True; break
+                    
+                    # Tier 4: YouTube
+                    yt_path = _try_youtube_asl_search(candidate)
+                    if yt_path:
+                        hybrid_results.append((phrase, yt_path))
+                        self.progress_signal.emit(pct, f"▶ Hybrid '{phrase}'")
+                        matched = True; break
+                    
+                    # Tier 5: AI Pose (Only if length == 1)
+                    if length == 1:
+                        # In Hybrid mode, we can reuse the sk_path if already gotten, 
+                        # or generate it now if we need it for hybrid.
+                        if not sk_path:
+                            sk_path = render_sign_mt_pose(word)
+                        
+                        if sk_path:
+                            hybrid_results.append((word, sk_path))
+                            self.progress_signal.emit(pct, f"Hybrid '{word}'")
+                            matched = True; break
 
-            if not matched:
-                hybrid_results.append((words[i], None))
-                self.progress_signal.emit(pct, f"✗ No hybrid sign for '{words[i]}'")
+                if not matched:
+                    hybrid_results.append((words[i], None))
+                    self.progress_signal.emit(pct, f"No hybrid sign for '{words[i]}'")
             
             i += 1 # We process word-by-word now for Dual Mode consistency
             
@@ -991,19 +1050,12 @@ class TranslatorWidget(QWidget):
         self.translate_btn.clicked.connect(self.start_translation)
         ctrl.addWidget(self.translate_btn)
 
-        self.export_hybrid_btn = QPushButton("Export Hybrid")
-        self.export_hybrid_btn.setFixedHeight(34)
-        self.export_hybrid_btn.setStyleSheet(self._btn("#7a3d00", "#5c2e00"))
-        self.export_hybrid_btn.setEnabled(False)
-        self.export_hybrid_btn.clicked.connect(lambda: self.export_video("hybrid"))
-        ctrl.addWidget(self.export_hybrid_btn)
-
-        self.export_skel_btn = QPushButton("Export Skeleton")
-        self.export_skel_btn.setFixedHeight(34)
-        self.export_skel_btn.setStyleSheet(self._btn("#4a148c", "#311b92"))
-        self.export_skel_btn.setEnabled(False)
-        self.export_skel_btn.clicked.connect(lambda: self.export_video("skeleton"))
-        ctrl.addWidget(self.export_skel_btn)
+        self.export_btn = QPushButton("Export Video")
+        self.export_btn.setFixedHeight(34)
+        self.export_btn.setStyleSheet(self._btn("#7a3d00", "#5c2e00"))
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(lambda: self.export_video(self._view_mode))
+        ctrl.addWidget(self.export_btn)
 
         root.addLayout(ctrl)
 
@@ -1176,8 +1228,7 @@ class TranslatorWidget(QWidget):
             # Reset results
             self.hybrid_items = []
             self.skeleton_items = []
-            self.export_hybrid_btn.setEnabled(False)
-            self.export_skel_btn.setEnabled(False)
+            self.export_btn.setEnabled(False)
         except Exception as e:
             print(f"[ERROR] browse_file failed: {e}")
             QMessageBox.critical(self, "Browse Error", f"Could not load video: {e}")
@@ -1220,8 +1271,7 @@ class TranslatorWidget(QWidget):
         self._clear_cards()
         self.transcript_lbl.setText("Transcribing...")
         self.translate_btn.setEnabled(False)
-        self.export_hybrid_btn.setEnabled(False)
-        self.export_skel_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self.progress.setValue(0)
 
         self.worker = TranscribeWorker(self.video_path)
@@ -1251,8 +1301,8 @@ class TranslatorWidget(QWidget):
         self._dot_timer.timeout.connect(self._pulse_waiting)
         self._dot_timer.start(400)
 
-        # Run the full matching in a background thread
-        self.match_worker = MatchWorker(text)
+        # Run the full matching in a background thread based on user preference
+        self.match_worker = MatchWorker(text, self._view_mode)
         self.match_worker.progress_signal.connect(self.on_progress)
         self.match_worker.done_signal.connect(self.on_match_done)
         self.match_worker.start()
@@ -1268,23 +1318,32 @@ class TranslatorWidget(QWidget):
         except:
             pass # Handle case where widget might be deleted mid-pulse
 
-    def on_match_done(self, hybrid, skeleton):
-        if hasattr(self, "_dot_timer"):
+    def on_match_done(self, hybrid_res, skeleton_res):
+        if not self.isVisible(): return # UI Guard
+        if hasattr(self, '_dot_timer') and self._dot_timer:
             self._dot_timer.stop()
         self._clear_cards()
 
-        self.hybrid_items = hybrid
-        self.skeleton_items = skeleton
+        self.hybrid_items = hybrid_res
+        self.skeleton_items = skeleton_res
         self.translate_btn.setEnabled(True)
-        self.export_hybrid_btn.setEnabled(True)
-        self.export_skel_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
         
         self.switch_view(self._view_mode)
-        self.status_lbl.setText("Translation complete. Toggle view to see Full Skeleton version.")
+        self.status_lbl.setText(f"Translation complete ({self._view_mode.capitalize()} mode).")
 
     def switch_view(self, mode):
         self._view_mode = mode
         self._clear_cards()
+        
+        # Update export button styling based on mode
+        if mode == "hybrid":
+            self.export_btn.setText("Export Hybrid Video")
+            self.export_btn.setStyleSheet(self._btn("#7a3d00", "#5c2e00"))
+        else:
+            self.export_btn.setText("Export Skeleton Video")
+            self.export_btn.setStyleSheet(self._btn("#4a148c", "#311b92"))
+
         items = self.hybrid_items if mode == "hybrid" else self.skeleton_items
         for word, path in items:
             self.cards_flow.addWidget(WordCard(word, path))
@@ -1304,8 +1363,7 @@ class TranslatorWidget(QWidget):
         out, _ = QFileDialog.getSaveFileName(self, f"Save {mode.capitalize()} Video", fname, "MP4 Video (*.mp4)")
         if not out: return
         
-        self.export_hybrid_btn.setEnabled(False)
-        self.export_skel_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self.translate_btn.setEnabled(False)
         
         self.status_lbl.setText(f"Exporting {mode} video...")
@@ -1314,8 +1372,7 @@ class TranslatorWidget(QWidget):
         self.export_worker.error_signal.connect(self.on_error)
         self.export_worker.done_signal.connect(lambda p: (
             QMessageBox.information(self, "Export", f"Video saved to: {p}"),
-            self.export_hybrid_btn.setEnabled(True),
-            self.export_skel_btn.setEnabled(True),
+            self.export_btn.setEnabled(True),
             self.translate_btn.setEnabled(True)
         ))
         self.export_worker.start()

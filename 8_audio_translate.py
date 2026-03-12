@@ -87,7 +87,8 @@ class AudioWorker(QThread):
 
     def stop(self):
         self._run_flag = False
-        self.wait()
+        # Do not call self.wait() here as it blocks the UI thread if processing is hung.
+        # Let the thread finish its loop naturally.
 
 class AudioTranslateWidget(QWidget):
     def __init__(self):
@@ -184,8 +185,14 @@ class AudioTranslateWidget(QWidget):
     def on_heard(self, text):
         self.clear_ui()
         self.results = match_gifs(text)
-        for word, hybrid, ai in self.results:
-            self.flow_layout.addWidget(WordCard(word, hybrid, ai))
+        for item in self.results:
+            # results can be (word, hybrid_path, ai_path) - ensure safe unpacking
+            if len(item) == 3:
+                word, hybrid, ai = item
+                self.flow_layout.addWidget(WordCard(word, hybrid, ai))
+            elif len(item) == 2:
+                word, path = item
+                self.flow_layout.addWidget(WordCard(word, path, None))
         
         if self.results:
             self.exp_h_btn.setEnabled(True)

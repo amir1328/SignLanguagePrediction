@@ -377,7 +377,7 @@ class CameraThread(QThread):
 
     def stop(self):
         self._run_flag = False
-        self.wait()
+        # Non-blocking stop system
 
 
 class AudioWorker(QThread):
@@ -580,20 +580,20 @@ class CommunicatorWidget(QWidget):
             row_layout.addWidget(msg_label)
             
         self.chat_layout.addWidget(row)
-        QTimer.singleShot(100, lambda: self.scroll_area.verticalScrollBar().setValue(
-            self.scroll_area.verticalScrollBar().maximum()
-        ))
+        try:
+            QTimer.singleShot(100, lambda: self.scroll_area.verticalScrollBar().setValue(
+                self.scroll_area.verticalScrollBar().maximum()
+            ))
+        except: pass
 
     def pause(self):
-        """Stops background threads to save resources."""
-        print("[Communicator] Pausing background threads...")
+        """Stops background threads to save resources — Non-blocking."""
+        print("[Communicator] Pausing background threads (Non-blocking)...")
         if hasattr(self, 'camera_thread'):
             self.camera_thread._run_flag = False
-            self.camera_thread.wait()
         if hasattr(self, 'audio_thread'):
             self.audio_thread._run_flag = False
-            self.audio_thread.wait()
-        self.status_label.setText("⏸ Threads Paused (Resource Saver)")
+        self.status_label.setText("Threads Paused (Resource Saver)")
 
     def resume(self):
         """Restarts background threads."""
@@ -602,8 +602,10 @@ class CommunicatorWidget(QWidget):
         self.status_label.setText("🟢 LSTM Network & Microphone Active")
 
     def on_sign_detected(self, sign_text):
+        if not self.isVisible(): return
         self.add_bubble(sign_text.capitalize(), sender="signer")
-        self.audio_thread.speak(sign_text)
+        if hasattr(self, 'audio_thread') and self.audio_thread:
+            self.audio_thread.speak(sign_text)
 
     def on_speech_heard(self, text):
         # 1. Show bubble in chat

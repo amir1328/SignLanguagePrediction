@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "C:\aazeero\Mano\8_audio_translate.py", line 168, in on_heard
+    for word, path in matches:
+        ^^^^^^^^^^
+ValueError: too many values to unpack (expected 2)

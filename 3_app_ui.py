@@ -468,17 +468,13 @@ class AudioWorker(QThread):
 # 3. Main Qt Application Window
 # =============================================================================
 
-class SignLanguageApp(QMainWindow):
+class CommunicatorWidget(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Two-Way Sign Language Communicator (LSTM GPU)")
-        self.resize(1200, 750)
         self.setStyleSheet("background-color: #1a1a1a; color: white; font-family: Segoe UI, sans-serif;")
         
         # Core Layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
+        main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(20)
         
@@ -588,6 +584,23 @@ class SignLanguageApp(QMainWindow):
             self.scroll_area.verticalScrollBar().maximum()
         ))
 
+    def pause(self):
+        """Stops background threads to save resources."""
+        print("[Communicator] Pausing background threads...")
+        if hasattr(self, 'camera_thread'):
+            self.camera_thread._run_flag = False
+            self.camera_thread.wait()
+        if hasattr(self, 'audio_thread'):
+            self.audio_thread._run_flag = False
+            self.audio_thread.wait()
+        self.status_label.setText("⏸ Threads Paused (Resource Saver)")
+
+    def resume(self):
+        """Restarts background threads."""
+        print("[Communicator] Resuming background threads...")
+        self.init_ai()
+        self.status_label.setText("🟢 LSTM Network & Microphone Active")
+
     def on_sign_detected(self, sign_text):
         self.add_bubble(sign_text.capitalize(), sender="signer")
         self.audio_thread.speak(sign_text)
@@ -642,8 +655,20 @@ class SignLanguageApp(QMainWindow):
             av.stop()
 
     def closeEvent(self, event):
-        self.camera_thread.stop()
-        self.audio_thread.stop()
+        if hasattr(self, 'camera_thread'): self.camera_thread.stop()
+        if hasattr(self, 'audio_thread'): self.audio_thread.stop()
+        event.accept()
+
+class SignLanguageApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Two-Way Sign Language Communicator (LSTM GPU)")
+        self.resize(1200, 750)
+        self.widget = CommunicatorWidget()
+        self.setCentralWidget(self.widget)
+
+    def closeEvent(self, event):
+        self.widget.closeEvent(event)
         event.accept()
 
 if __name__ == "__main__":
